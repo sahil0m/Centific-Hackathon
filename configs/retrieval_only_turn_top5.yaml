@@ -1,0 +1,42 @@
+# Retrieval-only mode: no LLM calls needed — good for testing the pipeline
+# without API keys or cost.
+experiment:
+  name: retrieval_only_turn_top5
+  seed: 42
+
+dataset:
+  name: locomo
+  path: data/raw/locomo10.json
+  split: all
+
+chunking:
+  strategy: turn
+  window_size: 1
+  include_speaker: true
+  include_timestamp: true
+  include_session_id: true
+
+embedding:
+  provider: sentence_transformers
+  model_name: BAAI/bge-small-en-v1.5
+  batch_size: 64
+  normalize_embeddings: true
+  cache_dir: data/processed/embedding_cache
+
+retrieval:
+  index_type: faiss
+  top_k: 5
+  same_conversation_only: true
+
+generation:
+  enabled: false  # no LLM calls
+
+evaluation:
+  compute_f1: false
+  compute_exact_match: false
+  compute_evidence_recall: true
+  compute_latency: true
+  compute_token_usage: false
+
+output:
+  dir: results

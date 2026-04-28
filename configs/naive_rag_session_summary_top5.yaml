@@ -1,0 +1,47 @@
+experiment:
+  name: naive_rag_session_summary_top5
+  seed: 42
+
+dataset:
+  name: locomo
+  path: data/raw/locomo10.json
+  split: all
+
+chunking:
+  strategy: session_summary
+  window_size: 1
+  include_speaker: true
+  include_timestamp: true
+  include_session_id: true
+
+embedding:
+  provider: sentence_transformers
+  model_name: BAAI/bge-small-en-v1.5
+  batch_size: 64
+  normalize_embeddings: true
+  cache_dir: data/processed/embedding_cache
+
+retrieval:
+  index_type: faiss
+  top_k: 5
+  same_conversation_only: true
+
+generation:
+  provider: anthropic
+  model_name: claude-3-5-sonnet-latest
+  temperature: 0
+  max_output_tokens: 120
+  cache_dir: data/processed/llm_cache
+  enabled: true
+
+evaluation:
+  compute_f1: true
+  compute_exact_match: true
+  compute_evidence_recall: true
+  compute_latency: true
+  compute_token_usage: true
+
+output:
+  dir: results
+# Note: if LoCoMo does not contain session summaries, this experiment will
+# log a warning and save an empty run record explaining why it was skipped.

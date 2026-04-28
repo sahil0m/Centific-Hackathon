@@ -1,0 +1,38 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# data (large files)
+data/raw/*.json
+data/raw/*.jsonl
+data/processed/
+
+# results (generated, not source)
+results/raw_predictions/
+results/retrieval/
+results/metrics/
+results/tables/
+results/reports/
+results/logs/
+
+# caches
+.cache/
+*.faiss
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
