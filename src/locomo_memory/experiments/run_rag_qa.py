@@ -120,12 +120,14 @@ def run_experiment(config_path: str) -> dict[str, Any]:
     chunk_cfg = cfg.get("chunking", {})
     strategy: str = chunk_cfg.get("strategy", "turn")
     window_size: int = chunk_cfg.get("window_size", 3)
+    context_window: int = chunk_cfg.get("context_window", 0)
 
-    logger.info("[Stage 2] Chunking conversations (strategy=%s)", strategy)
+    logger.info("[Stage 2] Chunking conversations (strategy=%s, context_window=%d)", strategy, context_window)
     all_chunks = build_chunks(
         conversations,
         strategy=strategy,
         window_size=window_size,
+        context_window=context_window,
         include_speaker=chunk_cfg.get("include_speaker", True),
         include_timestamp=chunk_cfg.get("include_timestamp", True),
         include_session_id=chunk_cfg.get("include_session_id", True),
@@ -175,12 +177,13 @@ def run_experiment(config_path: str) -> dict[str, Any]:
     }
 
     # ---------------------------------------------------------------
-    # 4. Build FAISS indices
+    # 4. Build FAISS indices (+ BM25 if hybrid enabled)
     # ---------------------------------------------------------------
     from locomo_memory.indexing.vector_index import MultiConversationIndex
 
     ret_cfg = cfg.get("retrieval", {})
     dim = all_embeddings.shape[1]
+    hybrid_bm25: bool = ret_cfg.get("hybrid_bm25", False)
 
     logger.info("[Stage 4] Building FAISS indices (dim=%d)", dim)
     multi_index = MultiConversationIndex()
@@ -191,16 +194,38 @@ def run_experiment(config_path: str) -> dict[str, Any]:
     )
 
     # ---------------------------------------------------------------
-    # 5. Set up retriever
+    # 5. Set up retriever (dense or hybrid BM25+dense)
     # ---------------------------------------------------------------
-    from locomo_memory.retrieval.dense_retriever import DenseRetriever
-
     top_k: int = ret_cfg.get("top_k", 5)
-    retriever = DenseRetriever(
-        index=multi_index,
-        embedder=embedder,
-        top_k=top_k,
-    )
+    candidate_k: int = ret_cfg.get("candidate_k", max(top_k * 3, 20))
+
+    if hybrid_bm25:
+        from locomo_memory.retrieval.bm25_retriever import MultiBM25Index
+        from locomo_memory.retrieval.hybrid_retriever import HybridRetriever
+
+        logger.info("[Stage 5] Building BM25 indices for hybrid retrieval")
+        bm25_index = MultiBM25Index()
+        bm25_index.build_all(dict(chunks_by_conv))
+
+        retriever = HybridRetriever(
+            dense_index=multi_index,
+            bm25_index=bm25_index,
+            embedder=embedder,
+            top_k=top_k,
+            candidate_k=candidate_k,
+        )
+        logger.info(
+            "[Stage 5] Hybrid retriever ready (top_k=%d, candidate_k=%d)",
+            top_k, candidate_k,
+        )
+    else:
+        from locomo_memory.retrieval.dense_retriever import DenseRetriever
+        retriever = DenseRetriever(
+            index=multi_index,
+            embedder=embedder,
+            top_k=top_k,
+        )
+        logger.info("[Stage 5] Dense-only retriever ready (top_k=%d)", top_k)
 
     # ---------------------------------------------------------------
     # 6 + 7. Retrieve + optionally generate

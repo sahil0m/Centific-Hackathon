@@ -1,9 +1,15 @@
 """
 Chunking strategies for LoCoMo conversations.
 
-Strategy A: turn    — one Turn = one Chunk
-Strategy B: window3 — sliding window of 3 adjacent turns
-Strategy C: session_summary — use session-level summary text if available
+Strategy A: turn            — one dialogue turn = one chunk
+Strategy B: window3         — sliding window of N adjacent turns
+Strategy C: session_summary — one session summary = one chunk
+
+Contextual enrichment (context_window > 0):
+  Each turn chunk embeds ±N surrounding turns as [Prior]/[Next] context lines,
+  but dia_ids metadata only contains the central turn. This means the embedding
+  captures surrounding context for better semantic matching while evidence recall
+  is computed correctly against the actual gold turn.
 """
 
 from __future__ import annotations
@@ -25,11 +31,18 @@ def build_chunks(
     conversations: list[Conversation],
     strategy: str,
     window_size: int = 3,
+    context_window: int = 0,
     include_speaker: bool = True,
     include_timestamp: bool = True,
     include_session_id: bool = True,
 ) -> list[Chunk]:
-    """Build chunks for all conversations using the specified strategy."""
+    """Build chunks for all conversations using the specified strategy.
+
+    Args:
+        context_window: For 'turn' strategy only. Number of adjacent turns to
+            include as [Prior]/[Next] context in the chunk text. Metadata
+            (dia_ids) still points only to the central turn.
+    """
     builder = _get_builder(strategy)
     all_chunks: list[Chunk] = []
     seen_ids: set[str] = set()
@@ -38,6 +51,7 @@ def build_chunks(
         chunks = builder(
             conv,
             window_size=window_size,
+            context_window=context_window,
             include_speaker=include_speaker,
             include_timestamp=include_timestamp,
             include_session_id=include_session_id,
@@ -50,10 +64,11 @@ def build_chunks(
             all_chunks.append(chunk)
 
     logger.info(
-        "Built %d chunks from %d conversations using strategy '%s'",
+        "Built %d chunks from %d conversations using strategy='%s' context_window=%d",
         len(all_chunks),
         len(conversations),
         strategy,
+        context_window,
     )
     return all_chunks
 
@@ -73,29 +88,44 @@ def _get_builder(strategy: str) -> Callable:
 
 
 # ---------------------------------------------------------------------------
-# Strategy A: turn
+# Strategy A: turn (with optional contextual enrichment)
 # ---------------------------------------------------------------------------
 
 def _build_turn_chunks(
     conv: Conversation,
     window_size: int = 1,
+    context_window: int = 0,
     include_speaker: bool = True,
     include_timestamp: bool = True,
     include_session_id: bool = True,
 ) -> list[Chunk]:
+    # Exclude summary turns — they belong to session_summary strategy only
+    dialogue_turns = [t for t in conv.turns if t.speaker.lower() != "summary"]
     chunks: list[Chunk] = []
-    for turn in conv.turns:
-        if turn.speaker.lower() == "summary":
-            continue  # summary turns belong only to session_summary strategy
-        text = _format_turn_text(
-            conv.conversation_id,
-            turn.session_id,
-            [turn.dia_id],
-            [(turn.speaker, turn.text, turn.timestamp)],
-            include_speaker=include_speaker,
-            include_timestamp=include_timestamp,
-            include_session_id=include_session_id,
-        )
+
+    for i, turn in enumerate(dialogue_turns):
+        if context_window > 0:
+            text = _format_turn_with_context(
+                conv.conversation_id,
+                turn,
+                dialogue_turns,
+                i,
+                context_window,
+                include_speaker=include_speaker,
+                include_timestamp=include_timestamp,
+                include_session_id=include_session_id,
+            )
+        else:
+            text = _format_turn_text(
+                conv.conversation_id,
+                turn.session_id,
+                [turn.dia_id],
+                [(turn.speaker, turn.text, turn.timestamp)],
+                include_speaker=include_speaker,
+                include_timestamp=include_timestamp,
+                include_session_id=include_session_id,
+            )
+
         chunk_id = _make_chunk_id(conv.conversation_id, "turn", [turn.dia_id])
         chunks.append(
             Chunk(
@@ -105,7 +135,7 @@ def _build_turn_chunks(
                 session_id=turn.session_id,
                 turn_index_start=turn.turn_index,
                 turn_index_end=turn.turn_index,
-                dia_ids=[turn.dia_id],
+                dia_ids=[turn.dia_id],        # only the central turn
                 speakers=[turn.speaker],
                 timestamps=[turn.timestamp],
                 text=text,
@@ -115,6 +145,58 @@ def _build_turn_chunks(
     return chunks
 
 
+def _format_turn_with_context(
+    conversation_id: str,
+    turn: Turn,
+    all_turns: list[Turn],
+    idx: int,
+    context_window: int,
+    include_speaker: bool,
+    include_timestamp: bool,
+    include_session_id: bool,
+) -> str:
+    """
+    Format a turn chunk with ±context_window surrounding turns as context.
+    Prior turns are prefixed with [Prior], next turns with [Next].
+    The central turn has no prefix so embeddings weight it naturally higher.
+    dia_ids in the Chunk metadata only contains the central turn's dia_id.
+    """
+    header_parts = [f"Conversation: {conversation_id}"]
+    if include_session_id:
+        header_parts.append(f"Session: {turn.session_id}")
+    header_parts.append(f"Dialog IDs: {turn.dia_id}")
+    header = "[" + " | ".join(header_parts) + "]"
+
+    lines = [header]
+
+    before = all_turns[max(0, idx - context_window): idx]
+    after  = all_turns[idx + 1: idx + 1 + context_window]
+
+    for ctx in before:
+        line = _format_line(ctx.speaker, ctx.text, ctx.timestamp, include_speaker, include_timestamp)
+        lines.append(f"[Prior] {line}")
+
+    # Central turn — no prefix
+    lines.append(_format_line(turn.speaker, turn.text, turn.timestamp, include_speaker, include_timestamp))
+
+    for ctx in after:
+        line = _format_line(ctx.speaker, ctx.text, ctx.timestamp, include_speaker, include_timestamp)
+        lines.append(f"[Next] {line}")
+
+    return "\n".join(lines)
+
+
+def _format_line(
+    speaker: str, text: str, timestamp: str,
+    include_speaker: bool, include_timestamp: bool,
+) -> str:
+    if include_speaker and include_timestamp and timestamp:
+        return f"[{timestamp}] {speaker}: {text}"
+    if include_speaker:
+        return f"{speaker}: {text}"
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Strategy B: window3 (sliding window)
 # ---------------------------------------------------------------------------
@@ -122,6 +204,7 @@ def _build_turn_chunks(
 def _build_window_chunks(
     conv: Conversation,
     window_size: int = 3,
+    context_window: int = 0,   # unused for window strategy
     include_speaker: bool = True,
     include_timestamp: bool = True,
     include_session_id: bool = True,
@@ -132,21 +215,20 @@ def _build_window_chunks(
     chunks: list[Chunk] = []
 
     for start in range(len(turns)):
-        window: list[Turn] = turns[start : start + window_size]
+        window: list[Turn] = turns[start: start + window_size]
         if not window:
             continue
 
-        dia_ids = [t.dia_id for t in window]
-        speakers = list(dict.fromkeys(t.speaker for t in window))
+        dia_ids    = [t.dia_id for t in window]
+        speakers   = list(dict.fromkeys(t.speaker for t in window))
         timestamps = [t.timestamp for t in window]
         session_id = window[0].session_id
 
-        messages = [(t.speaker, t.text, t.timestamp) for t in window]
         text = _format_turn_text(
             conv.conversation_id,
             session_id,
             dia_ids,
-            messages,
+            [(t.speaker, t.text, t.timestamp) for t in window],
             include_speaker=include_speaker,
             include_timestamp=include_timestamp,
             include_session_id=include_session_id,
@@ -177,15 +259,11 @@ def _build_window_chunks(
 def _build_session_summary_chunks(
     conv: Conversation,
     window_size: int = 1,
+    context_window: int = 0,   # unused
     include_speaker: bool = True,
     include_timestamp: bool = True,
     include_session_id: bool = True,
 ) -> list[Chunk]:
-    """
-    Uses session summaries if present on turns with speaker=='summary' or
-    on the conversation object itself. If none found, logs a warning and
-    returns empty list for this conversation.
-    """
     summary_turns = [t for t in conv.turns if t.speaker.lower() in ("summary", "system_summary")]
 
     if not summary_turns:
@@ -248,12 +326,7 @@ def _format_turn_text(
 
     lines = [header]
     for speaker, text, timestamp in messages:
-        if include_speaker and include_timestamp and timestamp:
-            lines.append(f"[{timestamp}] {speaker}: {text}")
-        elif include_speaker:
-            lines.append(f"{speaker}: {text}")
-        else:
-            lines.append(text)
+        lines.append(_format_line(speaker, text, timestamp, include_speaker, include_timestamp))
     return "\n".join(lines)
 
 
