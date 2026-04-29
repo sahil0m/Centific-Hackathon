@@ -1,0 +1,6 @@
+experiment,category,count,avg_f1,exact_match_rate,avg_evidence_recall,avg_grounding_score,guard_pass_rate
+ablation_07_se_only,1,282,0.0,0.0,0.1512,1.0,1.0
+ablation_07_se_only,2,321,0.0,0.0,0.5522,1.0,1.0
+ablation_07_se_only,3,96,0.0,0.0,0.2201,1.0,1.0
+ablation_07_se_only,4,841,0.0,0.0,0.5503,1.0,1.0
+ablation_07_se_only,5,446,0.0,0.0,0.5617,1.0,1.0

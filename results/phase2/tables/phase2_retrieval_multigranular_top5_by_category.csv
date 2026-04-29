@@ -1,0 +1,6 @@
+experiment,category,count,avg_f1,exact_match_rate,avg_evidence_recall,avg_grounding_score,guard_pass_rate
+phase2_retrieval_multigranular_top5,1,282,0.0,0.0,0.2374,1.0,1.0
+phase2_retrieval_multigranular_top5,2,321,0.0,0.0,0.6269,1.0,1.0
+phase2_retrieval_multigranular_top5,3,96,0.0,0.0,0.2434,1.0,1.0
+phase2_retrieval_multigranular_top5,4,841,0.0,0.0,0.6132,1.0,1.0
+phase2_retrieval_multigranular_top5,5,446,0.0,0.0,0.5841,1.0,1.0

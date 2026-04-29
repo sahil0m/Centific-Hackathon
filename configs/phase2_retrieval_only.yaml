@@ -1,0 +1,48 @@
+experiment:
+  name: phase2_retrieval_only
+  seed: 42
+
+dataset:
+  path: data/raw/locomo10.json
+
+ingestion:
+  use_turn_as_claim: true
+  claim_format: speaker_text
+  skip_summary_turns: true
+  min_turn_length: 3
+
+embedding:
+  model_name: BAAI/bge-small-en-v1.5
+  dim: 384
+  normalize: true
+  batch_size: 64
+  cache_dir: data/processed/embedding_cache
+
+retrieval:
+  top_k: 5
+  rrf_k: 60
+  dense_candidates: 20
+  bm25_candidates: 20
+  enable_bm25: true
+  enable_label_search: false
+  enable_graph_traversal: false
+
+context:
+  max_entries: 10
+
+generation:
+  enabled: false
+
+guard:
+  min_grounding_score: 0.0
+  require_uncertainty_for_conflicts: true
+
+evaluation:
+  compute_f1: true
+  compute_exact_match: true
+  compute_evidence_recall: true
+
+output:
+  dir: results/phase2
+
+db_dir: data/processed/phase2_db

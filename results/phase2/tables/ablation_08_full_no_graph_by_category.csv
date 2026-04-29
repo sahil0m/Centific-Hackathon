@@ -1,0 +1,6 @@
+experiment,category,count,avg_f1,exact_match_rate,avg_evidence_recall,avg_grounding_score,guard_pass_rate
+ablation_08_full_no_graph,1,282,0.0,0.0,0.2374,1.0,1.0
+ablation_08_full_no_graph,2,321,0.0,0.0,0.6269,1.0,1.0
+ablation_08_full_no_graph,3,96,0.0,0.0,0.2434,1.0,1.0
+ablation_08_full_no_graph,4,841,0.0,0.0,0.6132,1.0,1.0
+ablation_08_full_no_graph,5,446,0.0,0.0,0.5841,1.0,1.0

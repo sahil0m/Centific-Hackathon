@@ -1,0 +1,65 @@
+{
+  "experiment_name": "ablation_07_se_only",
+  "n_predictions": 1986,
+  "n_conversations": 10,
+  "avg_f1": 0.0,
+  "exact_match_rate": 0.0,
+  "avg_evidence_recall": 0.4811,
+  "avg_grounding_score": 1.0,
+  "guard_pass_rate": 1.0,
+  "retrieval_latency_p50": 74.33,
+  "retrieval_latency_p95": 119.74,
+  "retrieval_latency_mean": 76.14,
+  "end_to_end_latency_p50": 74.46,
+  "end_to_end_latency_p95": 119.89,
+  "avg_retrieved_mus": 5.0,
+  "by_category": {
+    "1": {
+      "count": 282,
+      "avg_f1": 0.0,
+      "exact_match_rate": 0.0,
+      "avg_evidence_recall": 0.1512,
+      "avg_grounding_score": 1.0,
+      "guard_pass_rate": 1.0
+    },
+    "2": {
+      "count": 321,
+      "avg_f1": 0.0,
+      "exact_match_rate": 0.0,
+      "avg_evidence_recall": 0.5522,
+      "avg_grounding_score": 1.0,
+      "guard_pass_rate": 1.0
+    },
+    "3": {
+      "count": 96,
+      "avg_f1": 0.0,
+      "exact_match_rate": 0.0,
+      "avg_evidence_recall": 0.2201,
+      "avg_grounding_score": 1.0,
+      "guard_pass_rate": 1.0
+    },
+    "4": {
+      "count": 841,
+      "avg_f1": 0.0,
+      "exact_match_rate": 0.0,
+      "avg_evidence_recall": 0.5503,
+      "avg_grounding_score": 1.0,
+      "guard_pass_rate": 1.0
+    },
+    "5": {
+      "count": 446,
+      "avg_f1": 0.0,
+      "exact_match_rate": 0.0,
+      "avg_evidence_recall": 0.5617,
+      "avg_grounding_score": 1.0,
+      "guard_pass_rate": 1.0
+    }
+  },
+  "zero_recall_count": 957,
+  "perfect_recall_count": 897,
+  "lane_distribution": {
+    "source_evidence": 9930
+  },
+  "avg_duplicate_dia_ids": 0.0,
+  "avg_same_session_density": 0.4362
+}

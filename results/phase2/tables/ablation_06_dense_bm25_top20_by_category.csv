@@ -1,0 +1,6 @@
+experiment,category,count,avg_f1,exact_match_rate,avg_evidence_recall,avg_grounding_score,guard_pass_rate
+ablation_06_dense_bm25_top20,1,282,0.0,0.0,0.4825,1.0,1.0
+ablation_06_dense_bm25_top20,2,321,0.0,0.0,0.7835,1.0,1.0
+ablation_06_dense_bm25_top20,3,96,0.0,0.0,0.4108,1.0,1.0
+ablation_06_dense_bm25_top20,4,841,0.0,0.0,0.7977,1.0,1.0
+ablation_06_dense_bm25_top20,5,446,0.0,0.0,0.7511,1.0,1.0

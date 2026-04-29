@@ -1,903 +1,522 @@
-# Phase 2 — SPARC-LTM Final Methodology
+# SPARC-LTM Phase 2 Methodology
 
-**Smart Context Management for Long-Horizon Conversational Memory**
+**SPARC-LTM** — Salience and Provenance Aware Reconciliation and Compression for Long-Term Memory
 
----
-
-## 1. Executive Summary
-
-Phase 2 transforms the naive RAG baseline into an enterprise-grade memory system that behaves like a smart memory manager — not just a search engine. Instead of storing raw conversation turns and treating them all equally, it extracts atomic facts, tracks their importance, manages four distinct memory tiers, automatically moves data between tiers when storage pressure builds, and lets the user override any decision.
-
-The system answers questions using structured memory (not raw text), detects and reconciles contradictions, compresses old context into smart labels while preserving the original data safely, and runs parallel search workers across all memory tiers when a question arrives.
+This document describes exactly what is implemented in the Phase 2 codebase.
+Every detail maps directly to actual code — nothing is assumed or extrapolated.
 
 ---
 
-## 2. The Core Problem (Why Phase 1 Fails)
+## 1. Architecture Overview
 
-| Failure Mode | Phase 1 Best Score | Why It Fails |
-|---|---|---|
-| Single-hop questions | 0.246 | Vocabulary mismatch — *"researching"* vs *"looking into"* |
-| Temporal questions | 0.233 | No concept of "most recent" or temporal ordering |
-| Multi-hop questions | 0.565 | Misses one of two required facts |
-| **Overall recall** | **0.591** | Bimodal: 35% of questions get zero recall |
-
-Phase 1 stores raw turns. Phase 2 stores normalized facts with importance scores, contradictions tracked, and tiered storage that compresses without losing information.
-
----
-
-## 3. Memory Architecture — 4 Tiers
+Every user message passes through an ingestion pipeline that extracts atomic facts,
+scores them, stores them, detects contradictions, indexes them, and manages capacity.
+Every question passes through a parallel retrieval pipeline that searches three memory
+states simultaneously, merges results, promotes retrieved forgotten memories, then
+generates a grounded answer.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  TIER 1: ACTIVE                                                     │
-│  - Full Memory Unit text (atomic claims)                            │
-│  - FAISS indexed for fast semantic search                           │
-│  - BM25 indexed for keyword search                                  │
-│  - Used directly in answer generation                               │
-│  - High salience, frequently accessed                               │
+│                         INGESTION PIPELINE                           │
+│                                                                       │
+│  raw text → FactExtractor → SalienceScorer → SQLite store            │
+│                → ContradictionResolver → FAISS + BM25 index          │
+│                → LifecycleEngine (auto compress / forget at 90%)     │
 └─────────────────────────────────────────────────────────────────────┘
-              ↓  Auto-move at 90% capacity (lowest utility first)
-              ↑  User prompt matches → restore full text
+
 ┌─────────────────────────────────────────────────────────────────────┐
-│  TIER 2: COMPRESSED (LABEL ONLY)                                    │
-│  - Short summary label (~10 words) + metadata                       │
-│  - Pointer to archived full data                                    │
-│  - FAISS indexed (label embedding only — light)                     │
-│  - When matched → fetch full data from Archived → promote to Active │
-└─────────────────────────────────────────────────────────────────────┘
-              ↓  Compressed label barely accessed for very long time
-              ↑  User prompt explicitly references → restore
-┌─────────────────────────────────────────────────────────────────────┐
-│  TIER 3: ARCHIVED (FULL DATA)                                       │
-│  - Stores the EXACT original full data of compressed MUs            │
-│  - Accessed only via Compressed-tier pointer                        │
-│  - NOT directly searched                                            │
-│  - Acts as the exact recovery layer                                 │
-└─────────────────────────────────────────────────────────────────────┘
-              ↓  Long unused + low salience + low frequency
-              ↑  User explicit restore action
-┌─────────────────────────────────────────────────────────────────────┐
-│  TIER 4: FORGOTTEN                                                  │
-│  - Memory deemed not useful — out of search                         │
-│  - Full text still preserved in DB (never deleted)                  │
-│  - Restorable: user override OR explicit AI search                  │
+│                         RETRIEVAL PIPELINE                           │
+│                                                                       │
+│  question ─┬─ Worker 1: FAISS dense over ACTIVE                      │
+│             ├─ Worker 2: BM25 sparse over ACTIVE                     │
+│             ├─ Worker 3: FAISS over COMPRESSED labels                │
+│             │            → pointer follow → ARCHIVE raw text         │
+│             └─ Worker 4: BM25 over FORGOTTEN                         │
+│                          → auto-promote hits to ACTIVE               │
+│                                                                       │
+│  RRF fusion → top-k → ContextBuilder → LLM answer                   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-**Key insight:** Compressed = label only (the metadata). Archived = full original data. The label points to the archive. When a user query matches the label, the full data is fetched from archive and promoted back to active.
+---
 
-### Source-of-Truth Discipline
+## 2. Memory States
 
-Not all storage layers are equal. They have explicit roles:
+Five states are defined in `MemoryStatus` (str enum):
 
-| Layer | Role | Rebuildable? |
-|---|---|---|
-| **SQLite** | **Single source of truth.** Holds every MU, label, archive entry, status, salience, edge metadata. All writes go here first, transactionally. | No — this IS the data |
-| FAISS (active + compressed) | Derived semantic search index | **Yes** — rebuild from SQLite anytime |
-| NetworkX graph | Derived relationship index | **Yes** — rebuild from SQLite edge tables anytime |
-| Disk archive files | Optional binary archive payloads | Yes — re-derived from SQLite full-text columns |
-
-If FAISS gets corrupted, the index is dropped and rebuilt from SQLite. If the NetworkX graph crashes mid-process, it is rebuilt from the SQLite edge tables on next startup. SQLite is the only layer that must survive — the rest are caches.
-
-### Status Lifecycle (5 States)
-
-Memory Units carry one of these statuses at any time:
-
-```
-active      → in use, retrievable, used in answer generation
-compressed  → label only in search; full data parked in archive
-archived    → full data preserved, only reached via label pointer
-forgotten   → removed from retrieval and model use; data preserved
-deleted     → permanently removed; only an audit tombstone remains
-```
-
-**Forgotten ≠ Deleted.** Forgotten data is still in SQLite and can be restored anytime. Deleted data is gone. Only the user can trigger delete — the system never auto-deletes.
+| State | Meaning | In retrieval indexes |
+|-------|---------|----------------------|
+| `active` | Working memory. All new facts start here. | FAISS dense + BM25 |
+| `compressed` | Low-salience. LLM summary label stored. Raw data in archive. | Label FAISS only |
+| `archived` | Backend storage for raw compressed data. Not a MU status — stored in `archived_entries` table. | Not directly searched |
+| `forgotten` | Very low salience. Removed from all hot indexes. | Searched by Worker 4 on demand |
+| `deleted` | Terminal. Content nulled out. Audit row written. | Never returned |
 
 ---
 
-## 4. The Memory Unit and Label Structure
+## 3. Core Data Schemas
 
-### Memory Unit (lives in Active tier)
+### 3.1 MemoryUnit
 
-```
-MemoryUnit:
-  mu_id:             unique identifier
-  conversation_id:   which conversation this came from
-  session_id:        which session
-  
-  # Content
-  claim:             "Caroline is researching adoption agencies"
-  original_text:     full raw turn text (for provenance)
-  
-  # Provenance
-  source_dia_ids:    [D2:5]
-  source_speaker:    "Caroline"
-  timestamp:         "2024-03-15"
-  extracted_at:      ISO timestamp of MU creation
-  
-  # Salience tracking
-  salience_score:        0.82
-  importance:            0.85   (LLM-judged)
-  recency_weight:        0.91
-  uniqueness:            0.78
-  retrieval_count:       12     (how often retrieved/used)
-  prompt_frequency:      0.34   (user prompt matches per total queries)
-  last_accessed:         ISO timestamp
-  
-  # State (one of: active | compressed | archived | forgotten | deleted)
-  status:                "active"
-  confidence:            0.92
-  
-  # Relationships (Graph DB)
-  superseded_by:         null or mu_id
-  conflicts_with:        []
-  related_to:            [mu_id, mu_id, ...]
-  
-  # User control
-  user_pinned:           false
-```
+The atomic unit of memory. Every extracted fact becomes one `MemoryUnit`.
 
-### Compressed Label (lives in Compressed tier)
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `mu_id` | str | `mu_{12-hex}` | Primary key |
+| `conversation_id` | str | required | Scope key — all retrieval is scoped to this |
+| `session_id` | str | required | Session the fact came from |
+| `claim` | str | required | The extracted atomic fact |
+| `original_text` | str | `""` | Raw source text before extraction |
+| `source_dia_ids` | list[str] | `[]` | Source dialogue turn IDs |
+| `source_speaker` | str | `""` | Speaker name |
+| `timestamp` | str\|None | None | Source turn timestamp |
+| `salience_score` | float [0,1] | 0.5 | Current salience (recomputed by scorer) |
+| `importance` | float [0,1] | 0.5 | Topic importance (set at extraction time) |
+| `recency_weight` | float [0,1] | 1.0 | Recency decay factor |
+| `uniqueness` | float [0,1] | 1.0 | Distinctiveness |
+| `retrieval_count` | int | 0 | Times this fact was retrieved |
+| `prompt_frequency` | float [0,1] | 0.0 | Frequency in prompts |
+| `last_accessed` | datetime\|None | None | Last retrieval timestamp |
+| `status` | MemoryStatus | `active` | Current lifecycle state |
+| `confidence` | float [0,1] | 0.9 | Extraction confidence |
+| `needs_reindex` | bool | False | Flag for FAISS sync after restore |
+| `compressed_label_id` | str\|None | None | Pointer to CompressedLabel (set when compressed) |
+| `archived_entry_id` | str\|None | None | Pointer to ArchivedEntry (set when compressed) |
+| `user_pinned` | bool | False | Pinned MUs are never auto-transitioned by lifecycle |
 
-```
-CompressedLabel:
-  label_id:              unique identifier
-  archived_pointer:      points to archived_mu_id
-  
-  # The label = the metadata
-  topic:                 "Career change"
-  short_summary:         "Caroline: Google → Microsoft (March 2024)"
-  key_entities:          ["Caroline", "Google", "Microsoft"]
-  time_range:            "2024-01-10 to 2024-03-15"
-  
-  # Embedding for search
-  label_embedding:       vector for FAISS
-  
-  # Provenance preserved
-  original_dia_ids:      [D1:3, D8:7]
-  
-  # Tracking
-  compressed_at:         ISO timestamp
-  retrieval_count:       0      (since compression)
-  last_label_match:      null
-```
+### 3.2 CompressedLabel
 
-### Archived Entry (lives in Archive tier)
+Created when a MemoryUnit is compressed. Stored in the `compressed_labels` table.
+This is what gets embedded and searched by Worker 3.
 
-```
-ArchivedEntry:
-  archived_mu_id:        unique identifier
-  label_pointer:         points back to label_id
-  
-  # The full original data — preserved exactly
-  full_memory_unit:      complete original MemoryUnit
-  full_original_text:    complete raw turn text
-  
-  # Restoration tracking
-  archived_at:           ISO timestamp
-  restoration_count:     0
-```
+| Field | Type | Description |
+|-------|------|-------------|
+| `label_id` | str | `lbl_{12-hex}` |
+| `archived_pointer` | str | Points to the ArchivedEntry |
+| `mu_id` | str | Which MemoryUnit this compresses |
+| `conversation_id` | str | Scope key |
+| `topic` | str | Rule-detected topic category |
+| `short_summary` | str | LLM-generated dense summary sentence (≤130 tokens) |
+| `key_entities` | list[str] | Regex-extracted capitalized named entities |
+| `time_range` | str\|None | Timestamp carried from source MU |
+| `original_dia_ids` | list[str] | Source dialogue IDs |
+| `retrieval_count` | int | Times this label matched a query |
 
-This three-piece structure is the heart of the design:
-- **Label** is small, searchable, lives in compressed tier
-- **Archive** holds the heavy full data, only fetched when needed
-- **Pointer** chain ensures we never lose anything
+### 3.3 ArchivedEntry
+
+Created atomically alongside every CompressedLabel. Stored in `archived_entries` table.
+This is the lossless raw data recovery layer.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `archived_entry_id` | str | `arc_{12-hex}` |
+| `label_pointer` | str | Points back to the CompressedLabel |
+| `mu_id` | str | Which MemoryUnit was archived |
+| `conversation_id` | str | Scope key |
+| `full_memory_unit_json` | str | Complete serialized MemoryUnit (Pydantic model_dump_json) |
+| `full_original_text` | str | Verbatim source text |
+| `restoration_count` | int | Times full content was loaded from archive |
+
+### 3.4 EdgeRecord
+
+Provenance edges between MemoryUnits. Stored in `edges` table.
+Unique constraint on `(source_mu_id, target_mu_id, edge_type)`.
+
+| Edge Type | Meaning |
+|-----------|---------|
+| `superseded_by` | old fact → new fact (job changed, location changed, fact updated) |
+| `conflicts_with` | bidirectional contradiction between two facts |
+| `related_to` | topically related but not contradictory |
+| `derived_from` | fact derived or inferred from another |
 
 ---
 
-## 5. Ingestion Pipeline (How Memory Gets Built)
+## 4. Ingestion Pipeline
+
+Entry point: `SystemEngine.process_message(text, speaker, session_id)`
+
+### Step 1 — Wrap into Chunk
+
+`_make_chunk` formats the raw text as:
 
 ```
-LoCoMo Conversation
-       ↓
-[1] Trivial Filter             (rule-based, removes greetings/laughs)
-       ↓
-[2] Semantic Chunking          (group consecutive turns by topic similarity)
-       ↓
-[3] Memory Candidate Detector  (lightweight scoring — should we even call the LLM?)
-       ↓
-[4] Agentic Chunking           (LLM extracts atomic facts from candidate chunks)
-       ↓
-[5] Embedding Generation       (BGE-small encodes each claim)
-       ↓
-[6] Salience Scoring           (multi-factor scoring, no LLM)
-       ↓
-[7] Contradiction Detection    (FAISS similarity → LLM classifier)
-       ↓
-[8] Graph Linking              (NetworkX records relationships)
-       ↓
-[9] Memory Store Write         (SQLite first → derived FAISS + graph)
+[Conversation: {conversation_id} | Session: {session_id}]
+{speaker}: {text}
 ```
 
-### Step 1 — Trivial Filter (Free, Fast)
+A random `dia_id` (`D` + 6 hex chars) and UTC timestamp are generated.
+`chunk_strategy` is set to `"live"`.
 
-Filters out turns with no extractable facts:
-- Less than 5 words
-- Pure greetings/affirmations: *"hi"*, *"ok"*, *"haha"*, *"yeah sure"*
-- Cuts ~15% of LLM extraction calls with zero accuracy loss
+### Step 2 — Fact Extraction (`FactExtractor`)
 
-### Step 2 — Semantic Chunking
+**Model:** `anthropic/claude-3-haiku` (via OpenRouter)
+**Parameters:** `temperature=0.0`, `max_output_tokens=512`, `max_facts_per_chunk=7`, `confidence=0.9`
 
-**What it does:** Groups consecutive turns that talk about the same topic into one semantic unit, instead of fixed-size windows.
+The LLM is prompted to extract atomic claims and return strict JSON:
 
-**How it works:**
-1. Embed every turn individually with BGE-small
-2. Walk through turns sequentially
-3. If `cosine(turn_i, turn_i-1) > 0.65` → same topic, extend current chunk
-4. Otherwise → close current chunk, start a new one
-
-**Example:**
-```
-Turn 1: "I quit my job at Google"           → chunk_1 starts
-Turn 2: "Yeah I was burned out there"       → similar (0.71) → chunk_1 extends
-Turn 3: "Anyway, weather is nice today"     → low sim (0.12) → chunk_2 starts
-Turn 4: "Going for a walk later"            → similar (0.68) → chunk_2 extends
+```json
+{"facts": [{"claim": "...", "speaker": "..." | null, "source_dia_id": "..." | null}]}
 ```
 
-**Why it beats fixed window3:** Topic boundaries are respected. A 3-turn fixed window can split a topic across chunks. Semantic chunking keeps it whole.
+Instructions given to the LLM:
+- Resolve pronouns to proper nouns
+- Skip questions and opinion hedges ("I think", "maybe", "perhaps")
+- One atomic claim per fact entry
 
-### Step 3 — Memory Candidate Detector (Cheap Filter Before LLM)
+**Fallback (if LLM fails):** Heuristic sentence splitter drops questions, opinions, and fragments shorter than 10 characters. Returns up to 7 facts with `confidence=0.5`.
 
-**Purpose:** Avoid calling the extraction LLM on chunks that obviously contain no extractable facts. The trivial filter only catches greetings; this step catches subtler low-value chunks (e.g., long emotional venting with no concrete facts, pure speculation, hypothetical "what if" debates).
+**Provenance resolution:**
+If the LLM-suggested `source_dia_id` matches a turn in the chunk, the fact is attributed to that specific turn (speaker and timestamp narrowed). Otherwise the full chunk dia_id list and joined speakers are used.
 
-**How it works (rule-based, no LLM, runs in microseconds):**
+**Output:** `ExtractionResult` with a list of `MemoryUnit` objects, all `status=ACTIVE`.
 
-```
-candidate_score =
-      0.30 * has_named_entity        # spaCy / regex catches Persons, Orgs, Dates
-    + 0.20 * verb_density             # action verbs vs filler
-    + 0.15 * is_factual_statement     # statement vs question/opinion
-    + 0.15 * has_concrete_topic_marker  # work, family, health, location, time
-    + 0.10 * length_normalized        # very short = lower; 30-150 words = ideal
-    + 0.10 * has_specific_number_or_date
+### Step 3 — Salience Scoring (`SalienceScorer`)
 
-if candidate_score >= 0.35:
-    → SEND to LLM extractor (Step 4)
-else:
-    → SKIP LLM; archive raw turn for provenance only
-```
+Called immediately after extraction: `scorer.score_and_update(mu)` writes `mu.salience_score`.
 
-**Expected savings:**
-- Trivial filter alone: ~15% of turns skipped
-- Trivial filter + Candidate Detector: **~35–45%** of turns skipped before LLM
-- Direct LLM-cost reduction with no measurable accuracy loss
+**6 sub-scores** combined via weighted sum:
 
-**Tunable threshold:** the 0.35 cutoff is a config value. For an ablation that disables the detector, set it to 0.0 — every chunk goes to the LLM.
+| Dimension | Weight | Formula |
+|-----------|--------|---------|
+| importance | 0.30 | `mu.importance` (set by TopicImportanceEstimator during extraction) |
+| confidence | 0.15 | `mu.confidence` |
+| recency | 0.20 | `exp(-k × days_since_last_access_or_creation)` where `k = ln(2) / 30` (half-life = 30 days) |
+| retrieval_frequency | 0.15 | `retrieval_count / (retrieval_count + 10)` saturation curve |
+| user_pinned | 0.10 | 1.0 if pinned, 0.0 otherwise |
+| uniqueness | 0.10 | `mu.uniqueness` |
 
-### Step 4 — Agentic Chunking (Fact Extraction)
+**Final salience:** `clamp(weighted_sum / sum_of_weights)` in `[0.0, 1.0]`
 
-**What it does:** An LLM agent reads each semantic chunk and decides what atomic facts to extract. It is "agentic" because it makes decisions — what counts as a complete fact, what to merge, what to skip.
+**Utility score** (used internally by LifecycleEngine): `salience / max(1.0, len(claim) / 100)`
 
-**LLM Call:** llama-3.1-8b-instruct via OpenRouter (~$0.07/M tokens — very cheap)
+### Step 4 — Persist to SQLite
 
-**Prompt:**
-```
-You are a memory extraction agent. Read this conversation chunk and extract 
-atomic facts. Make decisions:
-- One fact per line, complete and standalone
-- Normalize entity names to full form (resolve pronouns)
-- Merge facts that say the same thing differently
-- Skip opinions, questions, uncertain statements
-- Maximum 7 facts per chunk
+`store.insert_memory_unit(mu)` — WAL mode, single atomic write per MU.
 
-Chunk [Session 2 | 2024-03-15]:
-"Caroline: I quit Google. Starting Microsoft Monday. Super nervous though."
-"Jake: That's huge! What was the final straw at Google?"
-"Caroline: My team got reorged for the third time."
+### Step 5 — Contradiction Resolution (`ContradictionResolver`)
 
-Output JSON:
-{
-  "facts": [
-    "Caroline left Google in March 2024",
-    "Caroline starts at Microsoft on Monday after quitting Google",
-    "Caroline left Google because her team was reorganized three times",
-    "Caroline feels nervous about starting at Microsoft"
-  ]
-}
-```
+Each new MU is compared against all existing active MUs in the same conversation.
 
-Each extracted fact becomes one Memory Unit. **Every LLM call is cached by diskcache keyed on `model_name + prompt_template_hash + input_text_hash`** — exact same inputs always produce a cache hit, no second LLM call.
+**Comparison rules (applied in priority order):**
 
-### Step 5 — Embedding Generation
+| Relationship | Detection rule | Edge confidence |
+|-------------|---------------|-----------------|
+| `SAME_FACT` | Jaccard token overlap ≥ 0.70 | `min(1.0, jaccard)` |
+| `CONTRADICTION` | Negation word in new MU AND (jaccard ≥ 0.25 OR entity overlap ≥ 2) AND (entity overlap ≥ 1 OR same topic) | `0.6 + 0.1×min(entity_overlap,3) + 0.1×same_topic` |
+| `UPDATED_FACT` | Update verb in new MU ("joined", "moved to", "is now", "started at", "got married", "graduated from"…) AND (same topic OR entity overlap ≥ 1) | 0.75 |
+| `TEMPORAL_CHANGE` | Temporal marker in new MU ("used to", "previously", "formerly", "back when", "until recently"…) AND (same topic OR entity overlap ≥ 1) | 0.70 |
+| `RELATED` | Same topic OR jaccard ≥ 0.10 | `max(jaccard, 0.3 if same_topic else 0.0)` |
+| `UNRELATED` | None of the above | `max(0.0, 1.0 − jaccard)` |
 
-Each MU's claim text is embedded with `BAAI/bge-small-en-v1.5` (384-dim, normalized). Embeddings are cached by diskcache keyed on `model_name + text_hash`.
+**Tokenization:** lowercase, strip punctuation, remove 60+ stop words.
 
-### Step 6 — Salience Scoring (No LLM, Pure Math)
+**Edge creation policy:**
 
-```
-salience = 0.25 * entity_density       # named entities / word count
-         + 0.20 * recency_weight        # exp decay from session timestamp
-         + 0.20 * topic_importance      # rule-based (life events > chitchat)
-         + 0.15 * uniqueness            # 1 - max similarity to existing MUs
-         + 0.10 * prompt_frequency      # how often user has asked about this topic
-         + 0.10 * user_pin_bonus        # if pinned by user
+| Relationship | Edge written |
+|-------------|-------------|
+| SAME_FACT | old_mu → new_mu: `SUPERSEDED_BY` |
+| UPDATED_FACT | old_mu → new_mu: `SUPERSEDED_BY` |
+| TEMPORAL_CHANGE | old_mu → new_mu: `SUPERSEDED_BY` |
+| CONTRADICTION | both directions: `CONFLICTS_WITH` |
+| RELATED | old_mu → new_mu: `RELATED_TO` |
+| UNRELATED | no edge written |
 
-utility = salience / storage_cost
+Duplicate edges (same source, target, type) are silently skipped.
+
+### Step 6 — Index Update
+
+```python
+faiss_index.add_mu(mu)   # adds embedding to dense FAISS
+bm25_index.add_mu(mu)    # adds tokens to BM25
 ```
 
-Frequency tracking is critical here — it answers the requirement that *"user prompting frequency"* matters, not just timestamps.
+### Step 7 — Lifecycle (LifecycleEngine)
 
-### Step 7 — Contradiction Detection (LLM, Rarely Triggered)
+Called once per `process_message` call via `lifecycle.maybe_run(conversation_id)`.
 
-Two-pass pipeline:
+**Trigger:** pressure = `active_count / active_cap ≥ 0.90`
+**Active cap:** 100 (configured in SystemEngine)
+**Target:** run until pressure drops below 0.70
 
-**Pass 1 (cheap):** FAISS similarity search. Only proceed to LLM if `cosine_sim > 0.85`.
+**Selection:** ranks all active non-pinned MUs by salience ascending (lowest first).
+Transitions the required number to bring pressure below target:
 
-**Pass 2 (LLM):** llama-3.3-70b-instruct via OpenRouter classifies the relationship:
+| Salience | Transition |
+|----------|-----------|
+| `< 0.15` | MU → `FORGOTTEN` (via `forget_atomic`) |
+| `0.15 – 0.40` | MU → `COMPRESSED` (via `compress_atomic`, see Section 5) |
+| `≥ 0.40` or `user_pinned=True` | No change |
 
+**After any transitions:** all indexes fully rebuilt:
+```python
+faiss_index.rebuild_from_store(store, conversation_id)
+bm25_index.rebuild_from_store(store, conversation_id)
+label_index.rebuild_from_store(store)
+graph.rebuild_from_store(store)
 ```
-Claim A (2024-01-10): "Caroline works at Google"
-Claim B (2024-03-15): "Caroline joined Microsoft"
-
-Classify: same / updated / contradiction / temporal_change / related / unrelated
-```
-
-Output → `updated` → A's status flag changes (still `active` but with `superseded_by` populated), both kept.
-
-### Step 8 — Graph Linking (NetworkX)
-
-Every relationship is recorded in an in-memory graph:
-- `superseded_by` edges
-- `conflicts_with` edges  
-- `related_to` edges (e.g., surgery + cold medicine case)
-- `derived_from` edges (which raw turn produced which MU)
-
-Graph is used later for:
-- Relevance propagation during retrieval
-- State transition decisions (well-connected MUs stay active longer)
-- Conflict resolution display in UI
-
-> **Note:** NetworkX is a prototype-grade in-memory graph layer. It is rebuilt from SQLite edge tables on startup. For production scale (millions of MUs across many users), this layer would migrate to a real graph DB (Neo4j, Memgraph). For LoCoMo benchmark + demo scale, NetworkX is more than enough and avoids running another server.
-
-### Step 9 — Memory Store Write (SQLite-First)
-
-Writes follow strict source-of-truth discipline:
-
-```
-1. INSERT row into SQLite (transactional, atomic)
-   ├ memory_units table        (the canonical MU record)
-   ├ edges table               (graph relationships)
-   └ provenance table          (raw turn → MU mapping)
-   COMMIT or ROLLBACK
-
-2. After SQLite COMMIT succeeds:
-   ├ Add vector to FAISS active index   (best-effort)
-   └ Add node + edges to NetworkX graph (best-effort)
-
-3. If any derived index update fails:
-   ├ Log the failure (loguru WARNING)
-   ├ Mark the MU with needs_reindex = true
-   └ Background sweeper rebuilds derived indexes from SQLite later
-```
-
-**Why this matters:** the system can crash anywhere — between SQLite commit and FAISS write — and recover cleanly. On next startup, any MU with `needs_reindex = true` is re-added to FAISS from its SQLite row. The graph rebuilds from the edges table. No data loss is possible because SQLite is the only thing that has to be right.
 
 ---
 
-## 6. State Transition Engine (The 90% Capacity Trigger)
+## 5. Compression Pipeline
 
-This is the most important design decision. **Automatic transitions only fire when active memory hits ~90% of its capacity.** Below that threshold, the system does nothing automatic — it only responds to user overrides. This is the simplification you asked for.
+When a MU is compressed, two records are written inside a single SQLite transaction (`compress_atomic`). The transaction inserts the archive row, inserts the label row, then updates the MU status with both pointers. All three writes succeed together or none.
 
-### When Auto-Transitions Run
+### 5.1 LLM Label Generation (`LLMLabeler`)
 
-```
-if active_count < 0.90 * STORAGE_CAP:
-    do nothing automatic
-    only honor user override actions
-    
-if active_count >= 0.90 * STORAGE_CAP:
-    run TransitionEngine.compute()
-        ↓
-    decide what to compress, archive, forget
-```
+**Model:** `anthropic/claude-3-haiku`, `temperature=0.0`, `max_tokens=130`
+**Cache key:** `SHA256(mu_id + claim)[:20]`
+**Prompt template version:** `compress_label_v1`
 
-### Decision Factors (Multi-Factor, Not Just Time)
+The LLM receives the original claim and source text (truncated at 400 chars) and is instructed to:
+- Write a single dense sentence
+- Preserve all key info: full names, locations, dates, numbers, roles, relationships
+- State the type of fact (employment, preference, health, event, personal info, etc.)
+- Make it searchable for future queries
+- Return only the sentence — no prefix, no explanation
 
-For each candidate MU at the 90% trigger, compute:
+**Fallback:** if LLM call fails or returns fewer than 10 characters → `claim[:120]`
 
-```
-demotion_score = (
-      w1 * (1 - salience_score)        # low salience = demote
-    + w2 * (1 - prompt_frequency)      # rarely prompted about
-    + w3 * time_decay                  # old + unused = demote
-    + w4 * (1 - graph_centrality)      # isolated in graph = demote
-    + w5 * redundancy                   # similar MUs exist = demote
-    - w6 * user_pinned * 100           # never demote pinned
-)
-```
+### 5.2 What Gets Written Atomically
 
-The **GraphDB role** here: an MU that is heavily connected (related to many active MUs, references in conflicts, source of multiple derived facts) is more important than an isolated one. NetworkX computes betweenness centrality and degree centrality cheaply.
+**`compressed_labels` row:**
+- `short_summary` = LLM-generated label sentence
+- `topic` = rule-detected topic from TopicImportanceEstimator
+- `key_entities` = regex-extracted capitalized names from original claim
+- `archived_pointer` = ID of the corresponding ArchivedEntry
+- `label_id` = points back from MemoryUnit
 
-### Decision Outcomes (At 90% Trigger)
+**`archived_entries` row:**
+- `full_memory_unit_json` = complete Pydantic JSON of the MemoryUnit at compression time
+- `full_original_text` = verbatim source text
+- `label_pointer` = ID of the CompressedLabel
 
-The engine ranks all active MUs by `demotion_score` (descending) and processes the top 30%:
+**`memory_units` row update:**
+- `status` → `compressed`
+- `compressed_label_id` → `label_id`
+- `archived_entry_id` → `archived_entry_id`
+- `claim` field is **not changed** — only status and pointer fields are updated
 
-```
-For each candidate (highest demotion_score first):
-    if salience_score < 0.15 AND retrieval_count == 0:
-        → FORGOTTEN
-        (never been useful, not worth keeping searchable)
-    
-    elif salience_score < 0.40 OR (age > 30 days AND retrieval_count < 2):
-        → COMPRESSED + ARCHIVED
-        (worth keeping, but as label only)
-    
-    else:
-        → keep ACTIVE
-```
+### 5.3 Restoration (Compressed → Active)
 
-After processing, active count should drop to ~70% of cap, leaving headroom.
-
-### Compression Process (Active → Compressed + Archived)
-
-```
-1. LLM generates short label/summary (cheap model):
-     Input: full MU text + related MUs (up to 3)
-     Output: ~10-word summary + key entities
-     
-2. CREATE archived_entry:
-     archived_mu_id = new_id()
-     full_memory_unit = current MU (complete)
-     full_original_text = current MU.original_text
-     label_pointer = (set after step 3)
-     
-3. CREATE compressed_label:
-     label_id = new_id()
-     archived_pointer = archived_mu_id
-     short_summary = LLM output
-     key_entities = LLM output
-     label_embedding = embed(short_summary)
-     
-4. UPDATE: link label.archived_pointer ↔ archive.label_pointer
-     
-5. REMOVE original MU embedding from Active FAISS index
-     INSERT label_embedding into Compressed FAISS index
-     
-6. UPDATE SQLite: status = "compressed"
-```
-
-Now the MU exists in TWO places: a tiny searchable label, and the full original safely archived.
-
-### Forgotten Process (Active or Compressed → Forgotten)
-
-```
-1. SQLite: UPDATE status = "forgotten" (committed first)
-2. Remove embedding from any FAISS index (Active or Compressed)
-3. Mark NetworkX node as inactive (kept for relationship history)
-4. Full text still preserved in SQLite — NOT deleted
-5. Can be restored by user override or explicit AI fallback search
-```
-
-### Deleted Process (User-Triggered Only — Permanent)
-
-`forgotten` and `deleted` are different states. Forgotten data is dormant but recoverable. Deleted data is gone for good.
-
-```
-Deletion is NEVER automatic. Only the user can delete via UI override.
-
-When user clicks "Delete":
-  1. SQLite: UPDATE status = "deleted", null out content fields
-  2. Keep mu_id and a small audit row for traceability
-  3. Remove from all derived indexes (FAISS, graph)
-  4. Cannot be restored — content is gone
-
-Audit row preserves:
-  - mu_id, deletion timestamp, who triggered it
-  - Original conversation_id and source_dia_ids
-  - No claim text, no original text
-```
-
-This guarantees:
-- Auto-transitions never destroy data (only forget it)
-- The user has the only path to permanent deletion
-- A deletion audit trail exists for compliance / debugging
-
-### Restoration Process (User Prompt Matches Compressed Label)
-
-This is the magic part — exactly what you asked for:
-
-```
-Query arrives → search runs in parallel across all tiers (see §7)
-       ↓
-A search worker hits a Compressed label match
-       ↓
-1. Follow label.archived_pointer → fetch ArchivedEntry
-2. Reconstruct full MemoryUnit from ArchivedEntry.full_memory_unit
-3. INSERT MU back into Active FAISS index
-4. UPDATE SQLite: status = "active", restoration_count += 1
-5. Use the full data (not just the label) in answer generation
-```
-
-So when the user asks something matching a compressed label → full original data is restored from archive → used for answering. The label was essentially a "cache pointer" to the archive.
+`store.restore_atomic(mu_id)`:
+1. Verifies current status is `COMPRESSED`
+2. Updates MU: `status=ACTIVE`, clears `compressed_label_id` and `archived_entry_id`, sets `needs_reindex=True`
+3. Increments `restoration_count` on the archive entry
+4. Deletes the `compressed_labels` row
+5. Deletes the `archived_entries` row
+6. Returns the updated MemoryUnit
 
 ---
 
-## 7. Query Pipeline With Parallel Workers
+## 6. Retrieval Pipeline
 
-```
-                 User Question
-                       ↓
-              [Question Embedder]
-                       ↓
-     ┌────────────────┼────────────────┬───────────────┐
-     ↓                ↓                ↓               ↓
-[Worker 1]       [Worker 2]       [Worker 3]      [Worker 4]
-FAISS Dense      BM25 Sparse      Compressed       Graph
-on Active        on Active        Label Search    Traversal
-                                  (FAISS)         (NetworkX)
-     ↓                ↓                ↓               ↓
-  top-30           top-30          top-10           neighbors
-candidates       candidates      label hits       of high MUs
-     └────────────────┼────────────────┴───────────────┘
-                      ↓
-              [RRF Fusion + Dedup]
-                      ↓
-              top-30 candidate pool
-                      ↓
-        [Restoration Step if labels matched]
-        - For each compressed label hit:
-        - fetch full data from archive
-        - promote to active
-                      ↓
-         [Cross-Encoder Reranker]
-         BAAI/bge-reranker-base
-         scores (question, claim) jointly
-                      ↓
-                  Top-5 MUs
-                      ↓
-        [Confidence Threshold Check]
-        if mean_score < 0.5:
-          search Forgotten tier as fallback
-                      ↓
-              [Context Builder]
-        - ACTIVE section
-        - SUPERSEDED section
-        - CONFLICTED section
-        - RESTORED section
-                      ↓
-        [Answer LLM via OpenRouter]
-        Claude-3.5-Sonnet or GPT-4o
-                      ↓
-                  Answer
-```
+Entry point: `SystemEngine.ask(question, session_id, generate)`
 
-### Why Parallel Workers Matter
+### 6.1 Four Parallel Workers
 
-Each retrieval lane has different latency characteristics:
-- FAISS dense search: ~2ms
-- BM25 sparse search: ~5ms
-- Compressed label FAISS: ~1ms (smaller index)
-- Graph traversal: ~3ms
+All four workers are submitted simultaneously via `ThreadPoolExecutor(max_workers=4, thread_name_prefix="mem_retrieval")`. Each has a 15-second timeout. Failures are caught per-worker — remaining workers continue unaffected.
 
-Running them sequentially: ~11ms total.  
-Running them in parallel via `concurrent.futures.ThreadPoolExecutor`: ~5ms total (gated by slowest worker).
+**Worker 1 — Dense FAISS over ACTIVE**
+- Embedding model: `BAAI/bge-small-en-v1.5` (384-dim, L2-normalized float32)
+- Searches `MemoryFAISSIndex` which contains embeddings of all active MU `claim` texts
+- Candidate pool: 20 results
 
-For 1,986 questions × 4 lanes, parallelism saves ~12 seconds on retrieval alone. More importantly, when we add the cross-encoder reranker (slower), parallelism keeps total query latency under 100ms.
+**Worker 2 — BM25 sparse over ACTIVE**
+- Index: `rank_bm25` (`MemoryBM25Index`) over active MU `claim` texts
+- Candidate pool: 20 results
 
-### The 4 Worker Lanes
+**Worker 3 — FAISS over COMPRESSED labels → pointer follow → archive**
+- Searches `CompressedLabelFAISSIndex` which contains embeddings of all `short_summary` texts
+- Candidate pool: 10 results
+- For each label hit: verifies MU exists and has `status=COMPRESSED`
+- **Pointer follow:** calls `CompressionService.peek_archive(mu_id)` which:
+  - Reads `archived_entries` row
+  - Deserializes `full_memory_unit_json` back into a `MemoryUnit` object (non-destructive, no status change)
+- Replaces `hit.mu` with the deserialized archived MU — the LLM receives the full original claim text
+- `is_from_label=True` is set on the hit (used for RESTORED section in ContextBuilder)
 
-**Worker 1 — Dense FAISS over Active MUs**  
-Question embedded → cosine search in active index → top-30 candidates with scores.
+**Worker 4 — BM25 over FORGOTTEN**
+- Builds a temporary in-memory BM25 index from all `FORGOTTEN` MUs in the conversation
+- Candidate pool: 20 results
+- Returns `HybridHit` objects with `sources=["forgotten"]`
+- FORGOTTEN hits only pass the hydration filter if `"forgotten"` is in the MU's sources list
 
-**Worker 2 — BM25 over Active MU claims**  
-Question tokenized → BM25 ranking over active MU claims → top-30 with scores. Catches keyword matches dense search misses.
+### 6.2 RRF Fusion
 
-**Worker 3 — Compressed Label FAISS**  
-Question embedded → cosine search in compressed label index → top-10 label hits. Each hit triggers archive lookup if selected.
+All workers feed into a shared `rrf_map: dict[mu_id → {rrf_score, sources, label_summary}]`.
 
-**Worker 4 — Graph Traversal**  
-For top-5 candidates from Worker 1, traverse NetworkX graph 1-hop to find related MUs that might also be relevant. Good for multi-hop questions.
+**Contribution formula:** `1.0 / (60 + rank)` (rrf_k = 60)
 
-### Reranking (Cross-Encoder)
+Multiple workers scoring the same `mu_id` accumulate their contributions additively.
 
-After fusion, top-30 candidates go through `BAAI/bge-reranker-base`:
-- Joint encoding of (question, claim) — much stronger than bi-encoder cosine
-- Re-sorts the candidate pool
-- Top-5 rerank winners proceed to context building
+### 6.3 Graph Traversal (Lane 5, sequential — requires FAISS results first)
 
-Expected gain: +5-8% recall on top of hybrid retrieval.
+After FAISS results are available, 1-hop expansion follows edges from the top FAISS seed IDs:
+- Edge types traversed: `RELATED_TO`, `SUPERSEDED_BY`, `CONFLICTS_WITH`
+- Neighbor score: `seed_rrf_score × 0.80`
+- Only `ACTIVE` MUs from the same conversation are expanded
+- New neighbors added to `rrf_map` with `sources=["graph"]`
 
-### Forgotten Tier Fallback
+### 6.4 Top-k Selection
 
-If after reranking the top-5 MUs have mean score < 0.5, the system runs an additional search against the forgotten tier (lazily — only when needed). This handles your requirement that *"if user asks something related to forgotten context, AI should restore it."*
+All candidates sorted by accumulated RRF score descending. Default `top_k=5`.
 
-### Context Building
+### 6.5 Auto-Promotion of Forgotten Hits
 
-The retrieved MUs are organized into a structured prompt:
+After final top-k selection, every hit with `hit.mu.status == FORGOTTEN` is immediately promoted:
 
-```
-ACTIVE MEMORIES (use these first):
-[1] Caroline is researching adoption agencies
-    Source: Session 2, March 15 2024 | Confidence: 0.92
-
-[2] Caroline met with adoption agency on March 20th
-    Source: Session 3, March 20 2024 | Confidence: 0.88
-
-HISTORICAL CONTEXT (superseded, kept for reference):
-[3] Caroline worked at Google
-    SUPERSEDED by: Caroline now works at Microsoft (since March 2024)
-
-CONFLICTING (treat with caution):
-[4] Caroline owns a cat — CONFLICTS WITH: Caroline is allergic to cats
-
-RESTORED FROM COMPRESSED (label match → full data fetched):
-[5] Caroline mentioned hiking 12 times across early sessions
-    Restored because query matched label "outdoor activities"
-    Full original: [text]
+```python
+restored_mu = store.restore_from_forgotten(hit.mu.mu_id)
+# — SQLite: status → ACTIVE, needs_reindex=True
+hit.mu = restored_mu
+faiss_index.add_mu(restored_mu)   # immediately back in dense search index
+bm25_index.add_mu(restored_mu)   # immediately back in sparse search index
 ```
 
-### Answer Generation
+The fact is live in both SQLite and in-memory indexes without waiting for the next rebuild.
+The lifecycle engine will compress or forget it again on the next pressure check if its salience remains low.
 
-LLM Call #3 — Claude-3.5-Sonnet or GPT-4o via OpenRouter:
+---
+
+## 7. Context Building (`ContextBuilder`)
+
+Takes the final ranked `HybridHit` list and builds a structured evidence block for the LLM.
+
+### Section Assignment (first match wins)
+
+| Condition on hit | Section |
+|-----------------|---------|
+| `hit.is_from_label == True` | RESTORED |
+| `relation_meta.superseded_by` non-empty | HISTORICAL CONTEXT (SUPERSEDED) |
+| `relation_meta.conflicts_with` non-empty | CONFLICTING |
+| none of the above | ACTIVE MEMORIES |
+
+### Rendered Evidence Format
+
+Sections rendered in order: ACTIVE MEMORIES → RESTORED → HISTORICAL CONTEXT → CONFLICTING.
+
+Each entry:
+```
+[{index}] {claim}
+  Source: {speaker} | Session {session_id} | {timestamp} | conf={confidence:.2f}
+```
+
+SUPERSEDED entries append: `  SUPERSEDED BY: {newer claim text}`
+CONFLICTED entries append: `  CONFLICTS WITH: {conflicting claim text}`
+RESTORED entries append: `  Label matched: {label_summary}`
+
+### System Prompt (exact text sent to LLM)
 
 ```
-System: You answer questions using structured memory evidence.
+You are answering a question about a long multi-session conversation using structured memory evidence.
+
 Rules:
-  1. Use only evidence above
-  2. Trust newer SUPERSEDED facts over older ones
-  3. Acknowledge uncertainty for CONFLICTED memories
-  4. If no evidence supports the answer, say "No information available"
-
-[Structured context from above]
-
-Question: What did Caroline research?
-Answer:
+1. Use ONLY the evidence provided below.
+2. Trust ACTIVE MEMORIES first.
+3. For HISTORICAL CONTEXT entries marked SUPERSEDED, prefer the newer fact they were replaced by.
+4. For CONFLICTING memories, acknowledge the uncertainty explicitly.
+5. For RESTORED entries, use the full claim text provided.
+6. If no evidence supports the answer, reply exactly: "No information available."
+7. Give a short, direct answer. Do not explain your reasoning or cite evidence IDs.
 ```
 
 ---
 
-## 8. User Override System (Secondary Path, Saves LLM Calls)
+## 8. Answer Generation
 
-The Streamlit UI exposes manual controls. Every override is instant — no LLM call needed:
+**Model:** `anthropic/claude-3-haiku` (via OpenRouter)
+**Parameters:** `temperature=0.0`, `max_tokens=200`
+**Cache key:** `SHA256(question + rendered_context_text)[:20]`
+**Prompt template version:** `answer_v1`
 
-| User Action | What Happens | LLM Calls Saved |
-|-------------|--------------|-----------------|
-| Click "Restore to Active" on Forgotten | Direct SQLite update + FAISS insert | None during query |
-| Click "Restore" on Compressed label | Archive → Active in one step | Skip restoration logic |
-| Click "Compress" on Active MU | Forces compression even before 90% | Skip transition engine |
-| Click "Pin" on Active MU | Salience locked at 1.0 | Permanent active |
-| Click "Forget" on any MU | Direct status change to forgotten | None |
-| Click "Delete" on any MU | Permanent removal (only true delete) | None |
+Messages sent to the LLM:
+- `system`: ContextBuilder system prompt (above)
+- `user`: rendered evidence block + `\n\nQuestion:\n{question}\n\nAnswer:`
 
-**Why this matters for cost:** When the user knows certain context will be relevant (e.g., "I'm about to ask about my career history"), they can pre-restore those memories instead of letting the AI find them through retrieval. This:
-- Saves the cross-encoder reranker call
-- Skips potential forgotten-tier search
-- Reduces hallucination risk (right context guaranteed)
+If `generate=False` or no hits: answer returned is `hit[0].mu.claim` or `"No relevant memories found."` without any LLM call.
 
 ---
 
-## 9. Tech Stack — Component-by-Component
+## 9. Persistent Storage
 
-| # | System Component | Technology Used | Alternatives Considered | Why This One |
-|---|---|---|---|---|
-| 1 | Language | **Python 3.11** | Python 3.10, 3.12 | Best balance: faster than 3.10, more stable than 3.12, broad library compatibility |
-| 2 | Backend API | **FastAPI** | Flask, Django, Express | Auto OpenAPI docs, async support, Pydantic-native, type-safe |
-| 3 | Demo UI | **Streamlit** | Gradio, Dash, React | 50 lines = full UI, real-time updates, perfect for live demos |
-| 4 | Vector DB (Active + Compressed) | **FAISS** | Qdrant, Weaviate, Chroma, Milvus | No server, file-based, fastest in-memory exact search, proven at scale |
-| 5 | Sparse Retrieval | **rank-bm25** | Elasticsearch, Whoosh, Pyserini | Pure Python, no server, perfect for our scale (~10k MUs) |
-| 6 | Graph layer (prototype) | **NetworkX** | Neo4j, ArangoDB, Memgraph | In-memory, no server, full Python integration. **Note:** prototype-grade — for production scale, swap to Neo4j. Rebuilt from SQLite at startup, not a transactional store. |
-| 7 | Metadata Store (SQL) | **SQLite** | PostgreSQL, MySQL | File-based, zero config, ACID, more than enough for benchmark + demo |
-| 8 | Embeddings | **BAAI/bge-small-en-v1.5** | bge-large, e5-base-v2, OpenAI ada-002 | Local (free), 384-dim, top-tier on MTEB for its size class |
-| 9 | Reranker | **BAAI/bge-reranker-base** | Cohere Rerank, ms-marco MiniLM | Local (free), strong cross-encoder, runs on CPU |
-| 10 | LLM Provider | **OpenRouter** | Direct OpenAI, direct Anthropic | Single API for many models, cost optimization, fallback if one provider down |
-| 11 | LLM (Extraction) | **llama-3.1-8b-instruct** | mistral-7b, gpt-4o-mini | Cheapest capable extractor — $0.07/M tokens via OpenRouter |
-| 12 | LLM (Contradiction) | **llama-3.3-70b-instruct** | claude-haiku, gpt-4o-mini | Mid-tier reasoning, $0.59/M tokens, called rarely |
-| 13 | LLM (Answer) | **claude-3.5-sonnet** OR **gpt-4o** | gpt-4-turbo, claude-3-opus | Top-tier accuracy, both available via OpenRouter |
-| 14 | Cache Layer | **diskcache** | Redis, manual SHA256 files, joblib | Thread-safe, file-based, automatic LRU, no server |
-| 15 | Logging | **loguru** | logging stdlib, structlog | Colors, automatic rotation, single-line setup, structured output |
-| 16 | Data Validation | **Pydantic v2** | dataclasses, attrs, marshmallow | Type-safe, fast (Rust core), seamless FastAPI integration |
-| 17 | Config Loading | **YAML + Pydantic** | TOML, JSON, ENV-based | Human-readable, supports comments, validated by Pydantic |
-| 18 | Testing | **pytest** | unittest, nose2 | Fixtures, parametrization, plugin ecosystem |
-| 19 | Parallelism | **concurrent.futures.ThreadPoolExecutor** | asyncio, multiprocessing | Simple API, ideal for I/O-bound work (LLM calls + FAISS reads) |
-| 20 | DataFrames | **pandas** | polars, csv stdlib | Mature, handles all formats, well-known, results saving |
-| 21 | Numerical | **numpy** | torch, jax | Standard for vector math, FAISS-compatible |
-| 22 | Progress | **tqdm** | rich.progress, progress | Universal, works in terminal + Jupyter + scripts |
+### SQLite Database (`data/system/memory.db`)
 
----
+WAL journal mode, NORMAL synchronous mode. One connection per operation (thread-safe).
 
-## 9.1 Config Flags for Expensive Components
+| Table | Contents |
+|-------|---------|
+| `memory_units` | All MUs regardless of status |
+| `compressed_labels` | One row per compressed MU (LLM summary + entity data) |
+| `archived_entries` | One row per compressed MU (full JSON snapshot + raw text) |
+| `edges` | Typed provenance edges between MUs |
+| `deletion_audit` | Tombstone log for every deleted MU |
+| `schema_version` | Migration version tracking |
 
-Every expensive subsystem has a config flag so we can run cheap variants for ablation studies and cost control. All flags live in the experiment YAML file.
+### LLM Cache (`data/system/llm_cache/`)
 
-```yaml
-phase2:
-  # Memory extraction
-  enable_llm_extraction: true        # false → rule-based fact extraction (heuristic)
-  candidate_detector_threshold: 0.35 # lower = more LLM calls; 0.0 = always call LLM
+Disk-based cache (`diskcache`) keyed by `prompt_template_version + cache_input`.
+Shared across all three LLM use cases: fact extraction, compression labelling, and answer generation.
 
-  # Contradiction detection
-  enable_contradiction_llm: true     # false → embedding similarity only, no LLM classifier
-  contradiction_similarity_threshold: 0.85  # lower = more LLM contradiction calls
+### In-Memory Indexes (rebuilt from SQLite on startup)
 
-  # Retrieval pipeline
-  enable_reranker: true              # false → hybrid RRF top-5 directly
-  enable_compressed_label_search: true   # false → search active tier only
-  enable_graph_traversal_worker: true    # false → 3 workers instead of 4
-  enable_forgotten_tier_fallback: true   # false → never search forgotten
+| Index | Contents |
+|-------|---------|
+| `MemoryFAISSIndex` | Float32 embeddings of ACTIVE MU `claim` texts |
+| `MemoryBM25Index` | BM25 token index of ACTIVE MU `claim` texts |
+| `CompressedLabelFAISSIndex` | Float32 embeddings of `compressed_labels.short_summary` texts |
+| `MemoryGraphIndex` | NetworkX directed graph of all EdgeRecord relationships |
 
-  # Lifecycle
-  storage_cap: 500                   # max active MUs per conversation
-  transition_trigger_pct: 0.90       # when to fire auto-transitions
-  enable_compression_llm: true       # false → use first 10 words as label
-
-  # Caching (always on, but configurable directories)
-  cache_dir: data/processed/phase2_cache
-```
-
-**Cache key construction (for every LLM call):**
-
-```
-cache_key = sha256(
-    model_name + "|" +
-    prompt_template_version + "|" +
-    sha256(input_text)
-)[:16]
-```
-
-This ensures: changing the prompt template invalidates cache; changing the model invalidates cache; same model + same template + same input always hits cache.
-
-**Why these flags matter for the benchmark:**
-
-- The ablation table the project requires (SPARC-LTM full / minus salience / minus reranker / etc.) is just a sweep over these YAML flags
-- Cost control: run a fast cheap pass first, then a high-quality pass for the final demo
-- Each flag is independently testable, no code changes between ablations
+All indexes are derived caches. SQLite is the only durable source of truth. Indexes can be rebuilt from SQLite at any time.
 
 ---
 
-## 10. Architecture Diagram (Full System)
+## 10. SystemEngine Configuration
 
-```
-                        ╔════════════════════════════════╗
-                        ║      STREAMLIT DEMO UI         ║
-                        ║  Chat panel | Memory inspector ║
-                        ╚═══════════════╤════════════════╝
-                                        │
-                        ╔═══════════════╧════════════════╗
-                        ║       FASTAPI BACKEND          ║
-                        ║  /chat /memory /override       ║
-                        ╚═══════════════╤════════════════╝
-                                        │
-       ┌────────────────────────────────┼────────────────────────────────┐
-       │                                │                                │
-       ↓                                ↓                                ↓
-╔═══════════════╗              ╔═══════════════╗              ╔═══════════════╗
-║   INGESTION   ║              ║   QUERY       ║              ║   TRANSITION  ║
-║   PIPELINE    ║              ║   PIPELINE    ║              ║   ENGINE      ║
-║               ║              ║               ║              ║               ║
-║ Semantic      ║              ║ 4 Parallel    ║              ║ Triggers @90% ║
-║  Chunking     ║              ║  Workers      ║              ║  capacity     ║
-║      ↓        ║              ║      ↓        ║              ║      ↓        ║
-║ Agentic       ║              ║ RRF Fusion    ║              ║ GraphDB +     ║
-║  Chunking     ║              ║      ↓        ║              ║  Salience +   ║
-║      ↓        ║              ║ Restoration   ║              ║  Frequency    ║
-║ Salience +    ║              ║ (label hits)  ║              ║      ↓        ║
-║  Contradict   ║              ║      ↓        ║              ║ Compress +    ║
-║      ↓        ║              ║ Reranker      ║              ║  Archive +    ║
-║ Graph Link    ║              ║      ↓        ║              ║  Forget       ║
-║      ↓        ║              ║ Context Build ║              ║               ║
-║ Store         ║              ║      ↓        ║              ║               ║
-║               ║              ║ Answer LLM    ║              ║               ║
-╚═══════╤═══════╝              ╚═══════╤═══════╝              ╚═══════╤═══════╝
-        │                              │                              │
-        └──────────────┬───────────────┴──────────────┬───────────────┘
-                       ↓                              ↓
-            ╔══════════════════════╗      ╔═══════════════════════╗
-            ║  STORAGE LAYER       ║      ║  CACHE LAYER          ║
-            ║  ─────────────       ║      ║  ─────────────        ║
-            ║  SQLite (metadata)   ║      ║  diskcache            ║
-            ║  FAISS (active)      ║      ║   ├ embeddings        ║
-            ║  FAISS (compressed)  ║      ║   ├ LLM extractions   ║
-            ║  NetworkX (graph)    ║      ║   ├ LLM contradicts   ║
-            ║  Files (archived)    ║      ║   └ LLM answers       ║
-            ╚══════════════════════╝      ╚═══════════════════════╝
-```
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `conversation_id` | `"user_default"` | All memories scoped to this ID |
+| `db_path` | `"data/system/memory.db"` | SQLite file path |
+| `model_extract` | `"anthropic/claude-3-haiku"` | Used for fact extraction and compression labelling |
+| `model_answer` | `"anthropic/claude-3-haiku"` | Used for answer generation |
+| `embedding_model` | `"BAAI/bge-small-en-v1.5"` | 384-dim normalized embeddings |
+| `active_cap` | `100` | Max active MUs before lifecycle fires |
+
+**Retrieval default config:**
+
+| Config field | Value |
+|-------------|-------|
+| `top_k` | 5 |
+| `dense_candidates` | 20 |
+| `bm25_candidates` | 20 |
+| `label_candidates` | 10 |
+| `rrf_k` | 60 |
+| `enable_bm25` | True |
+| `enable_label_search` | True |
+| `enable_graph_traversal` | True |
+| `enable_forgotten_worker` | True |
 
 ---
 
-## 11. End-to-End Test Cases
+## 11. Lifecycle Thresholds Reference
 
-| # | Scenario | Phase 2 Behavior | Expected Result |
-|---|---|---|---|
-| 1 | Simple factual question | Search active → direct answer | Recall ≥ 0.55 |
-| 2 | Multi-hop question | Both facts as separate MUs, both retrieved | Recall ≥ 0.72 |
-| 3 | Temporal question (most recent) | Recency weight + SUPERSEDED ordering | Recall ≥ 0.55 |
-| 4 | Outdated fact (Google→Microsoft) | SUPERSEDED label, newer fact preferred | Correct current answer |
-| 5 | Genuine contradiction | CONFLICTED flag → LLM acknowledges | Honest answer with uncertainty |
-| 6 | Related but not conflicting (surgery+cold) | Both retrieved as related | Safe answer with full context |
-| 7 | Storage at 90% | Auto-compress + archive lowest utility | Active count drops to ~70% |
-| 8 | Question matches compressed label | Restore full data from archive → active | Full text used in answer |
-| 9 | Question matches forgotten MU | Confidence < 0.5 → search forgotten | Restored if relevant |
-| 10 | User pins a fact | Salience = 1.0, never auto-compressed | Stays active forever |
-| 11 | User manually restores forgotten MU | Direct DB + FAISS update | No LLM call needed |
-| 12 | Trivial turns (greetings) | Pre-filter skips them | Zero LLM cost |
-| 13 | API failure mid-ingestion | diskcache + SQLite resume | No data loss on retry |
-| 14 | Same fact different wording | Contradiction LLM = "same" → dedup | Single MU |
-| 15 | Long conversation (1000+ turns) | Incremental ingestion + 90% cap management | Stable memory size |
-| 16 | Cross-conversation isolation | Per-conversation SQLite + FAISS | No leakage |
-| 17 | Concurrent queries | ThreadPoolExecutor parallelism | <100ms latency p95 |
-| 18 | Reranker model unavailable | Falls back to RRF top-5 | Graceful degradation |
-| 19 | OpenRouter rate limit | Tenacity retry with exponential backoff | Auto-recovery |
-| 20 | Memory inspection from UI | FastAPI returns SQLite snapshot | Real-time view |
+| Threshold | Value | Meaning |
+|-----------|-------|---------|
+| Lifecycle trigger | 90% of `active_cap` | Compression pass starts |
+| Lifecycle target | 70% of `active_cap` | Compression pass stops |
+| Forget boundary | salience < 0.15 | MU → FORGOTTEN |
+| Compress boundary | 0.15 ≤ salience < 0.40 | MU → COMPRESSED |
+| Recency half-life | 30 days | Time for recency score to halve |
+| Retrieval saturation | `n / (n + 10)` | Retrieval frequency sub-score |
+| Salience weights sum | 1.00 | importance(0.30) + confidence(0.15) + recency(0.20) + retrieval(0.15) + pinned(0.10) + uniqueness(0.10) |
 
 ---
 
-## 12. Implementation Plan (Build Order)
+## 12. What Phase 2 Does Not Include
 
-> **Important:** Phase 1 baseline code is **frozen** and must not be modified. Phase 2 is built as a separate `phase2/` module tree. Phase 1 results (`mean_evidence_recall = 0.485` and `0.591`) are the comparison anchors.
-
-### Week 1 — Core Backend (No UI)
-
-Strict build order — each step depends on the previous:
-
-1. **Schemas** (Pydantic v2) — `MemoryUnit`, `CompressedLabel`, `ArchivedEntry`, `EdgeRecord`, configs
-2. **Memory Store (SQLite — source of truth)** — full schema, migrations, transaction wrappers
-3. **Memory Candidate Detector** — rule-based extractability scoring
-4. **Semantic Chunker** — pure Python topic-boundary chunking
-5. **Fact Extractor (Agentic Chunker, LLM Call #1)** — OpenRouter + diskcache + retries + cache-key discipline
-6. **Salience Scorer** — multi-factor scoring with frequency tracking
-7. **Lifecycle Engine (State Transition)** — 90% trigger + demotion scoring + 5-state lifecycle
-8. **Contradiction Resolver (LLM Call #2)** — FAISS similarity gate + LLM classifier
-9. **Derived Indexes** — FAISS (active + compressed) + NetworkX graph, both rebuildable from SQLite
-10. **Retriever** — 4-worker parallel pipeline, RRF fusion, restoration step, cross-encoder reranker
-11. **Context Builder** — structured prompt sections (active / superseded / conflicted / restored)
-12. **Answer LLM (LLM Call #3)** — OpenRouter + caching with prompt-hash discipline
-13. **Evaluator (Phase 2 runner)** — extends Phase 1 runner, same metrics, separate output dir
-14. **Run on LoCoMo** — produce ablation grid + final benchmark numbers
-
-### Week 2 — Demo & UI
-
-15. **FastAPI backend** — `/chat`, `/memory/{conv_id}`, `/override/{action}`
-16. **Streamlit chat UI** — left panel
-17. **Streamlit memory inspector** — right panel with tabs per status
-18. **Storage gauge + transition animations**
-19. **Conflict resolution cards**
-20. **Manual override controls** (pin, compress, forget, delete, restore)
-21. **Provenance trail viewer**
-22. **Comparison report** (Phase 1 vs Phase 2 with confidence intervals)
-23. **Final tests + documentation + demo recording**
-
----
-
-## 13. Expected Performance
-
-> **These are design targets, not guaranteed outcomes.** Real results depend on extraction quality, contradiction-detector precision, embedding model behavior on LoCoMo's specific vocabulary, and LLM availability via OpenRouter. The numbers below are based on published cross-domain results for similar architectures and our own Phase 1 ablation deltas — actual measured results will be reported honestly after the LoCoMo run, including any underperforming categories.
-
-| Metric | Phase 1 Best | Phase 2 Design Target | Reason |
-|---|---|---|---|
-| Single-hop recall | 0.246 | ~0.55 | Claim normalization removes vocabulary gap |
-| Multi-hop recall | 0.565 | ~0.72 | Each hop is a separate MU, both can be retrieved |
-| Temporal recall | 0.233 | ~0.55 | Timestamps + SUPERSEDED + recency weight |
-| Adversarial recall | 0.714 | ~0.80 | Maintains hybrid gains + better context structure |
-| Adv open-ended recall | 0.669 | ~0.76 | Compression + restoration + multi-MU context |
-| **Overall recall** | **0.591** | **~0.72–0.78 (target range)** | Compounding improvements; not a guarantee |
-| **Retrieval latency p95** (before LLM answer) | ~3ms | **<100ms** | Parallel workers + reranker — applies only to retrieval, not the full LLM-answer path which depends on OpenRouter |
-| End-to-end latency p95 (incl. LLM answer) | n/a | 1–4s typical | Bounded by upstream LLM provider |
-| API cost per QA item | $0 | ~$0.005 (with caching) | Most calls cached + cheap models for ingestion |
-
-**Guardrails for honest reporting:**
-- Run final benchmark with all caches cleared once, then with caches warm — report both
-- Report per-category recall, not just overall
-- If a category regresses vs Phase 1, document and explain why
-- Include latency breakdown: retrieval-only vs full pipeline
-- Include API cost breakdown: extraction / contradiction / answer
-
----
-
-## 14. Why This Methodology Wins (Hackathon Judging Criteria)
-
-| Criterion | How We Win |
-|---|---|
-| **Speed** | Parallel 4-worker retrieval (<100ms before LLM), diskcache, FAISS exact search |
-| **Accuracy** | Claim normalization, contradiction handling, reranker, restoration |
-| **Implementation simplicity** | File-based stores (SQLite, FAISS, NetworkX) — no servers needed |
-| **Demo quality** | Live Streamlit chat + real-time memory state visualization |
-| **Reproducibility** | YAML configs + diskcache = same input = same output forever |
-| **Professional appearance** | Type-safe Pydantic, structured loguru logs, FastAPI auto docs |
-| **Robustness** | Atomic writes, retry logic, graceful degradation, resumable |
-| **Correctness** | No use of gold evidence at retrieval time, same eval as baseline |
-
----
-
-## 15. The One-Sentence Summary
-
-> Phase 2 is an AI memory manager that extracts atomic facts from conversations, stores them in 4 tiers (active, compressed labels, archived full data, forgotten), automatically rebalances the tiers when storage hits 90% capacity using salience and prompt frequency, lets the user override any decision, searches all tiers in parallel when a question arrives, restores compressed memories from archive on demand, and answers questions with structured provenance-grounded context — using OpenRouter for cost-optimized LLM calls across extraction, contradiction detection, and answer generation.
+- No user-facing memory management actions from the chat UI (Memory Inspector view is read-only)
+- No manual promote / compress / delete from chat interface
+- No ingestion of historical LoCoMo conversations (only live chat messages are ingested)
+- No LoCoMo benchmark evaluation in Phase 2 (Phase 1 pipeline handles benchmark runs separately)
+- No graph traversal initiated from FORGOTTEN or COMPRESSED seeds (only ACTIVE seeds expand)
+- No cross-conversation memory (all retrieval strictly scoped to `conversation_id`)
+- No multi-user memory separation beyond `conversation_id`

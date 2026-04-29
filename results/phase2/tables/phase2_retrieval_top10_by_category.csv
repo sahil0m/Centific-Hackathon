@@ -1,0 +1,6 @@
+experiment,category,count,avg_f1,exact_match_rate,avg_evidence_recall,avg_grounding_score,guard_pass_rate
+phase2_retrieval_top10,1,282,0.0,0.0,0.3558,1.0,1.0
+phase2_retrieval_top10,2,321,0.0,0.0,0.722,1.0,1.0
+phase2_retrieval_top10,3,96,0.0,0.0,0.3313,1.0,1.0
+phase2_retrieval_top10,4,841,0.0,0.0,0.7045,1.0,1.0
+phase2_retrieval_top10,5,446,0.0,0.0,0.6379,1.0,1.0
