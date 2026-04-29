@@ -20,6 +20,7 @@ import os
 import sys
 import uuid
 from pathlib import Path
+from collections import deque
 
 import streamlit as st
 
@@ -36,6 +37,15 @@ try:
     load_dotenv()
 except ImportError:
     pass
+
+# Import security utilities
+from locomo_memory.security.validators import (
+    InputValidator,
+    APIKeyValidator,
+    ValidationError,
+)
+from locomo_memory.security.sanitizers import InputSanitizer, LogSanitizer
+from locomo_memory.security.rate_limiter import RateLimiter, RateLimitConfig, RateLimitExceeded
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -77,7 +87,9 @@ _TIER = {
     MemoryStatus.ARCHIVED:   ("🔷", "Archived"),
     MemoryStatus.DELETED:    ("🔴", "Deleted"),
 }
-_DB_PATH = "data/system/memory.db"
+_DB_PATH = os.environ.get("SPARC_DB_PATH", "data/system/memory.db")
+_MAX_MESSAGES_PER_CHAT = 100  # Prevent unbounded memory growth
+_MAX_INPUT_LENGTH = 2000  # Prevent DoS via large inputs
 
 # ---------------------------------------------------------------------------
 # Session state
@@ -88,15 +100,21 @@ def _init() -> None:
         st.session_state.engine = None
     if "engine_error" not in st.session_state:
         st.session_state.engine_error = None
-    # chats: {cid: {"name": str, "messages": list, "session_id": str}}
+    # chats: {cid: {"name": str, "messages": deque, "session_id": str}}
     if "chats" not in st.session_state:
         cid = _cid()
-        st.session_state.chats = {cid: {"name": "Chat 1", "messages": [], "session_id": "s1"}}
+        st.session_state.chats = {cid: {"name": "Chat 1", "messages": deque(maxlen=_MAX_MESSAGES_PER_CHAT), "session_id": "s1"}}
         st.session_state.active_chat = cid
     if "active_chat" not in st.session_state:
-        st.session_state.active_chat = list(st.session_state.chats.keys())[0]
+        chat_keys = list(st.session_state.chats.keys())
+        st.session_state.active_chat = chat_keys[0] if chat_keys else _cid()
     if "view" not in st.session_state:
         st.session_state.view = "chat"
+    # Initialize rate limiter
+    if "rate_limiter" not in st.session_state:
+        st.session_state.rate_limiter = RateLimiter(
+            RateLimitConfig(max_requests=100, window_seconds=60.0)
+        )
 
 
 def _cid() -> str:
@@ -113,13 +131,22 @@ def _engine() -> SystemEngine | None:
     if not key:
         st.session_state.engine_error = "OPENROUTER_API_KEY not set in .env"
         return None
+    
+    # Validate API key format
+    try:
+        key = APIKeyValidator.validate_openrouter_key(key)
+    except ValidationError as e:
+        st.session_state.engine_error = f"Invalid API key: {e}"
+        return None
 
     with st.spinner("Starting SPARC-LTM… (loading embedding model)"):
         try:
             e = SystemEngine(db_path=_DB_PATH, api_key=key)
             st.session_state.engine = e
         except Exception as exc:
-            st.session_state.engine_error = str(exc)
+            # Sanitize error message before displaying
+            error_msg = LogSanitizer.sanitize(str(exc))
+            st.session_state.engine_error = error_msg
             return None
     return st.session_state.engine
 
@@ -165,7 +192,8 @@ def _sidebar() -> None:
                 if len(st.session_state.chats) > 1:
                     if st.button("✕", key=f"del_{cid}"):
                         del st.session_state.chats[cid]
-                        st.session_state.active_chat = list(st.session_state.chats.keys())[-1]
+                        remaining_chats = list(st.session_state.chats.keys())
+                        st.session_state.active_chat = remaining_chats[-1] if remaining_chats else _cid()
                         st.rerun()
 
         st.divider()
@@ -240,8 +268,32 @@ def _view_chat() -> None:
 
     prompt = st.chat_input("Say something or ask a question…", key=f"inp_{cid}")
     if prompt:
-        _handle_message(engine, cid, chat, prompt.strip(), do_gen)
-        st.rerun()
+        # Validate and sanitize input
+        try:
+            sanitized = InputValidator.validate_text_input(
+                prompt, 
+                max_length=_MAX_INPUT_LENGTH,
+                field_name="message"
+            )
+            
+            # Check rate limit
+            try:
+                st.session_state.rate_limiter.check_limit(cid)
+            except RateLimitExceeded as e:
+                st.error(f"⚠️ {str(e)}")
+                return
+            
+            # Basic prompt injection check
+            if not InputValidator.is_safe_for_llm(sanitized):
+                st.warning("⚠️ Your message contains patterns that may not be processed correctly. Please rephrase.")
+                return
+            
+            _handle_message(engine, cid, chat, sanitized, do_gen)
+            st.rerun()
+        except ValidationError as e:
+            st.error(f"⚠️ {str(e)}")
+        except Exception as e:
+            st.error(f"⚠️ An error occurred. Please try again.")
 
 
 def _handle_message(engine: SystemEngine, cid: str, chat: dict, text: str, do_gen: bool) -> None:
@@ -265,7 +317,8 @@ def _handle_message(engine: SystemEngine, cid: str, chat: dict, text: str, do_ge
         hits = result.hits
         retrieval_ms = result.retrieval_latency_ms
         answer = result.answer
-        if not do_gen and hits:
+        if not do_gen and hits and len(hits) > 0:
+            # Safe access to first hit
             answer = f"Based on memory: **{hits[0].mu.claim}**"
     else:
         # Statement: ingest into memory
@@ -418,7 +471,9 @@ LLM responses are cached in `data/system/llm_cache/` to save API cost.
 """)
     key = os.environ.get("OPENROUTER_API_KEY", "")
     if key:
-        st.success(f"API key loaded ({key[:12]}…)")
+        # Mask API key for security
+        masked_key = APIKeyValidator.mask_key(key, visible_chars=4)
+        st.success(f"API key loaded ({masked_key})")
     else:
         st.error("OPENROUTER_API_KEY not set")
 

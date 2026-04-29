@@ -21,6 +21,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 
 from loguru import logger
 
@@ -45,6 +46,7 @@ from locomo_memory.phase2.salience.scorer import SalienceScorer
 from locomo_memory.phase2.schemas import MemoryStatus, MemoryUnit
 from locomo_memory.phase2.store.graph_index import MemoryGraphIndex
 from locomo_memory.phase2.store.sqlite_store import MemoryStore
+from locomo_memory.security.validators import APIKeyValidator, ConversationIDValidator, ValidationError
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -126,15 +128,25 @@ class SystemEngine:
         embedding_model: str = "BAAI/bge-small-en-v1.5",
         active_cap: int = 100,
     ) -> None:
-        self.conversation_id = conversation_id
+        # Validate conversation_id
+        try:
+            self.conversation_id = ConversationIDValidator.validate(conversation_id)
+        except ValidationError as e:
+            raise ValueError(f"Invalid conversation_id: {e}")
+        
         self._model_extract = model_extract
         self._model_answer = model_answer
 
-        # Resolve API key
+        # Resolve and validate API key
         _key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
-        if not _key:
-            raise ValueError("OPENROUTER_API_KEY not set — cannot initialise SystemEngine")
+        try:
+            _key = APIKeyValidator.validate_openrouter_key(_key)
+        except ValidationError as e:
+            raise ValueError(f"Invalid API key: {e}")
 
+        # Thread safety for index updates
+        self._index_lock = Lock()
+        
         # Persistent storage
         _db = Path(db_path)
         _db.parent.mkdir(parents=True, exist_ok=True)
@@ -143,7 +155,7 @@ class SystemEngine:
 
         # LLM client + cache
         _cache_dir = Path(db_path).parent / "llm_cache"
-        _cache = LLMCache(str(_cache_dir))
+        _cache = LLMCache(str(_cache_dir), size_limit_bytes=10 * 1024 * 1024 * 1024)  # 10GB limit
         self._llm = OpenRouterClient(api_key=_key, cache=_cache)
 
         # Embedding + indexes
@@ -263,9 +275,10 @@ class SystemEngine:
                 ):
                     superseded.append(action.edge.source_mu_id)
 
-            # Step 5 — update indexes incrementally
-            self.faiss_index.add_mu(mu)
-            self.bm25_index.add_mu(mu)
+            # Step 5 — update indexes incrementally (thread-safe)
+            with self._index_lock:
+                self.faiss_index.add_mu(mu)
+                self.bm25_index.add_mu(mu)
             new_mus.append(mu)
             logger.info("Ingested: [{:.2f}] '{}'", mu.salience_score, mu.claim[:60])
 
@@ -276,9 +289,11 @@ class SystemEngine:
                 "Lifecycle: compressed={}, forgotten={}",
                 batch.n_compressed, batch.n_forgotten,
             )
-            self.faiss_index.rebuild_from_store(self.store, conversation_id=self.conversation_id)
-            self.bm25_index.rebuild_from_store(self.store, conversation_id=self.conversation_id)
-            self.label_index.rebuild_from_store(self.store)
+            # Rebuild indexes after lifecycle changes (thread-safe)
+            with self._index_lock:
+                self.faiss_index.rebuild_from_store(self.store, conversation_id=self.conversation_id)
+                self.bm25_index.rebuild_from_store(self.store, conversation_id=self.conversation_id)
+                self.label_index.rebuild_from_store(self.store)
 
         return ProcessResult(
             raw_text=text,
