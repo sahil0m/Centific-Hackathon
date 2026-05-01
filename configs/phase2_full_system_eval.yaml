@@ -1,0 +1,31 @@
+experiment:
+  name: phase2_full_system_eval
+
+dataset:
+  path: data/raw/locomo10.json
+  # max_conversations: null   # uncomment + set to limit (e.g. 2 for smoke-test)
+  # max_qa_per_conversation: null
+
+llm:
+  model_extract: anthropic/claude-3-haiku   # cheap/fast for fact extraction
+  model_answer: anthropic/claude-3-haiku    # used for grounded answer generation
+
+embedding:
+  model_name: BAAI/bge-small-en-v1.5
+
+ingestion:
+  active_cap: 500            # max active MUs before lifecycle compression fires
+  skip_summary_turns: true   # skip turns with speaker=summary/system
+  min_turn_length: 3         # skip very short turns (whitespace noise)
+
+generation:
+  enabled: true              # set false for retrieval-only (no LLM answer calls)
+
+guard:
+  min_grounding_score: 0.0   # allow all answers through guard (collect raw scores)
+  require_uncertainty_for_conflicts: true
+
+output:
+  dir: results/phase2
+
+db_dir: data/processed/phase2_system_db

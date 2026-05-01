@@ -1,24 +1,41 @@
 """Contradiction Resolver with Provenance — Phase 2 Milestone 7.
 
-Compares MemoryUnit claims using rule-based token overlap, topic
-classification, and pattern matching.  Creates EdgeRecords in the store for
-provenance tracking.  No LLM call required.
+Compares MemoryUnit claims using NLI (Natural Language Inference) as the
+primary signal, with rule-based pattern matching for update/temporal
+categorisation in the NLI-neutral zone.  Creates EdgeRecords in the store
+for provenance tracking.  No LLM call required at inference time (the NLI
+model is a pre-trained cross-encoder loaded once).
+
+Research basis
+--------------
+NLI / Textual Entailment is the standard NLP approach for determining whether
+one sentence contradicts, entails, or is neutral with respect to another
+(Bowman et al. 2015 — SNLI; Williams et al. 2018 — MultiNLI).  Using
+``cross-encoder/nli-deberta-v3-large`` (He et al. 2021) gives state-of-the-art
+zero-shot contradiction detection without hand-crafted keyword lists.
+
+Hybrid design: NLI + rules
+---------------------------
+NLI is used as the primary signal for contradiction and same-fact detection
+because it reads both claims jointly and captures semantic polarity (negation,
+antonyms, scope).  Rules remain necessary for categorising the NLI-neutral
+zone into UPDATED_FACT / TEMPORAL_CHANGE / RELATED / UNRELATED, because these
+categories depend on domain-specific markers (update verbs, temporal adverbs)
+rather than logical entailment alone.
 
 Relationship taxonomy
 ---------------------
-SAME_FACT        High token Jaccard (≥0.70) — near-duplicate or identical claim.
-UPDATED_FACT     Newer claim supersedes older on same topic (update verb present).
-TEMPORAL_CHANGE  Newer claim explicitly references a past state of the same topic.
-CONTRADICTION    Newer claim negates older on same entities/topic.
-RELATED          Same topic or moderate overlap — no clear update or conflict.
-UNRELATED        No meaningful overlap.
+SAME_FACT        NLI entailment ≥ 0.70 (and no update verb) — near-duplicate.
+UPDATED_FACT     NLI neutral zone + update verb present on same topic/entity.
+TEMPORAL_CHANGE  NLI neutral zone + temporal marker present on same topic/entity.
+CONTRADICTION    NLI contradiction ≥ 0.70 — newer claim negates older semantically.
+RELATED          Same topic or moderate token overlap — no stronger signal.
+UNRELATED        No meaningful overlap or topic match.
 
 Conservative design
 -------------------
-When uncertain the resolver prefers RELATED or UNRELATED over a false-positive
-CONTRADICTION.  CONTRADICTION requires *both* a negation pattern in the newer
-claim *and* sufficiently high token Jaccard (≥0.25) or strong entity overlap
-(≥2 shared entities).
+When NLI is uncertain (all scores < threshold), the resolver falls back to
+rules and prefers RELATED over a false-positive CONTRADICTION.
 
 Edge policy
 -----------
@@ -81,9 +98,27 @@ _NEGATION_RE = re.compile(
 )
 
 _UPDATE_VERB_RE = re.compile(
-    r"\b(joined|moved\s+to|relocated\s+to|is\s+now|now\s+works|now\s+lives"
-    r"|changed\s+to|switched\s+to|transferred\s+to|started\s+at|enrolled\s+in"
-    r"|graduated\s+from|got\s+married|got\s+engaged|had\s+a\s+baby|hired|promoted)\b",
+    r"\b("
+    # Job / employer changes
+    r"joined|started\s+(at|working|a\s+new)|began\s+working|now\s+works|"
+    r"now\s+working|currently\s+works|currently\s+working|now\s+employed|"
+    r"recently\s+(joined|started|hired)|accepted\s+(a|an)\s+(new\s+)?job|"
+    r"took\s+(a|an)\s+(new\s+)?job|got\s+(a|an)\s+(new\s+)?job|"
+    r"is\s+now\s+(at|working|employed)|left\s+for\s+(a\s+new\s+)?|"
+    r"hired\s+(at|by|as)|promoted\s+(to|as)|switched\s+(to|companies)|"
+    r"changed\s+(to|companies|jobs?)|transferred\s+to|"
+    # Location changes
+    r"moved\s+(to|into|back\s+to)|relocated\s+(to|from)|"
+    r"now\s+lives|living\s+(in|at)\s+(?:a\s+new|my\s+new)|"
+    # Relationship changes
+    r"got\s+married|got\s+engaged|got\s+divorced|"
+    r"is\s+now\s+(married|engaged|single|dating)|"
+    r"started\s+dating|broke\s+up|separated\s+from|"
+    # Education
+    r"enrolled\s+in|graduated\s+from|completed\s+(a|his|her|their)|"
+    # Generic update markers
+    r"is\s+now|now\s+is|recently\s+became|became\s+(a|an|the)"
+    r")\b",
     _I,
 )
 
@@ -93,12 +128,13 @@ _TEMPORAL_RE = re.compile(
     _I,
 )
 
-# Jaccard thresholds
-_SAME_FACT_J: float = 0.70
+# NLI decision thresholds — probabilities from the cross-encoder
+_NLI_CONTRADICTION_THRESHOLD: float = 0.70
+_NLI_ENTAILMENT_THRESHOLD: float = 0.70
+
+# Jaccard thresholds for rule-based fallback (NLI-neutral zone)
+_SAME_FACT_J: float = 0.60
 _RELATED_J: float = 0.10
-# CONTRADICTION: must clear this OR have ≥2 shared entities
-_CONTRADICTION_J: float = 0.25
-_CONTRADICTION_ENTITY: int = 2
 
 
 # ---------------------------------------------------------------------------
@@ -225,38 +261,71 @@ def _meta_json(comp: ComparisonResult) -> str:
 
 
 class ContradictionResolver:
-    """Rule-based contradiction detection and provenance edge creation.
+    """NLI-primary contradiction detection with provenance edge creation.
+
+    Uses ``cross-encoder/nli-deberta-v3-large`` as the primary signal for
+    contradiction and same-fact detection, with rule-based pattern matching
+    for UPDATED_FACT / TEMPORAL_CHANGE classification in the NLI-neutral zone.
 
     Args:
         store: the SQLite-backed :class:`~locomo_memory.phase2.store.sqlite_store.MemoryStore`.
+        nli_classifier: optional pre-constructed NLI classifier.  If ``None``,
+            :class:`~locomo_memory.phase2.contradiction.nli_classifier.NLIContradictionClassifier`
+            is lazy-loaded on the first :meth:`compare` call.  Pass a
+            :class:`~locomo_memory.phase2.contradiction.nli_classifier.FakeNLIClassifier`
+            in unit tests to avoid downloading the model.
 
     All ``compare*`` methods are pure (no DB access).
     ``create_edges_for``, ``resolve_incoming``, ``resolve_mu``, and
     ``scan_conversation`` write to the store.
     """
 
-    def __init__(self, store: MemoryStore) -> None:
+    def __init__(self, store: MemoryStore, *, nli_classifier=None) -> None:
         self.store = store
         self._estimator = TopicImportanceEstimator()
+        self._nli = nli_classifier  # None → lazy-loaded real model on first use
+
+    def _get_nli(self):
+        if self._nli is None:
+            try:
+                from locomo_memory.phase2.contradiction.nli_classifier import (
+                    NLIContradictionClassifier,
+                )
+                clf = NLIContradictionClassifier()
+                clf._load()  # trigger model download now so any failure is caught here
+                self._nli = clf
+            except Exception as exc:
+                from locomo_memory.phase2.contradiction.nli_classifier import FakeNLIClassifier
+                logger.warning(
+                    "NLI model unavailable ({}), falling back to heuristic classifier", exc
+                )
+                self._nli = FakeNLIClassifier()
+        return self._nli
 
     # ------------------------------------------------------------------
     # Core comparison  (pure — no DB access)
     # ------------------------------------------------------------------
 
     def compare(self, mu_a: MemoryUnit, mu_b: MemoryUnit) -> ComparisonResult:
-        """Classify the relationship between two MUs.
+        """Classify the relationship between two MUs using NLI + rules.
 
         Convention: ``mu_a`` is the existing/older claim; ``mu_b`` is the
-        incoming/newer one.  Patterns are checked in mu_b's claim text.
+        incoming/newer one.  Pattern matching is applied to ``mu_b``'s claim.
 
-        Rules (applied in priority order)
-        ----------------------------------
-        1. Jaccard ≥ 0.70                         → SAME_FACT
-        2. Negation in mu_b + strong overlap      → CONTRADICTION
-        3. Update verb in mu_b + topic/entity hit → UPDATED_FACT
-        4. Temporal marker in mu_b + topic hit    → TEMPORAL_CHANGE
-        5. Same topic or Jaccard ≥ 0.10           → RELATED
-        6. Otherwise                              → UNRELATED
+        Decision order
+        --------------
+        1. NLI contradiction ≥ 0.70 + negation in B + Jaccard ≥ 0.25  → CONTRADICTION
+        2. NLI entailment   ≥ 0.70 + same_topic + update verb          → UPDATED_FACT
+        3. NLI entailment   ≥ 0.70 + same_topic                        → SAME_FACT
+        3x. NLI entailment  ≥ 0.70 + different topics                  → RELATED (guard)
+        4. (NLI neutral zone) Update verb + same_topic                  → UPDATED_FACT
+        5. (NLI neutral zone) Implicit update (same high-value topic, diff entities) → UPDATED_FACT
+        6. (NLI neutral zone) Temporal marker + same_topic              → TEMPORAL_CHANGE
+        7. Same topic or Jaccard ≥ 0.10                                 → RELATED
+        8. Otherwise                                                     → UNRELATED
+
+        All supersession-capable paths (steps 2–6) require ``same_topic``.
+        Entity overlap alone is never sufficient to trigger supersession.
         """
         claim_a = mu_a.claim
         claim_b = mu_b.claim
@@ -273,68 +342,149 @@ class ContradictionResolver:
         ent_b = self._estimator.extract_entities(claim_b)
         ent_ov = _entity_overlap(ent_a, ent_b)
 
-        # 1. SAME_FACT
-        if j >= _SAME_FACT_J:
+        has_update = bool(_UPDATE_VERB_RE.search(claim_b))
+        has_temporal = bool(_TEMPORAL_RE.search(claim_b))
+        has_negation_b = bool(_NEGATION_RE.search(claim_b))
+
+        # --- 1. NLI primary signal ---
+        nli = self._get_nli().classify(claim_a, claim_b)
+
+        # --- 2. NLI contradiction → CONTRADICTION ---
+        # The NLI model treats any two claims that cannot both be true
+        # simultaneously as "contradiction" — this includes updates ("joined
+        # Microsoft") and temporal changes ("used to live in Paris"), which
+        # are logically incompatible with the older claim but belong to
+        # different categories in our taxonomy.
+        #
+        # Guard: require an explicit negation word in claim_b AND sufficient
+        # token overlap (≥ 0.25).  Updates / temporal changes have no
+        # negation, so they fall through to the rule-based zone below.
+        # Different-object negations ("doesn't like sushi" vs "likes pizza")
+        # have low overlap and are also excluded.
+        if (
+            nli.contradiction >= _NLI_CONTRADICTION_THRESHOLD
+            and has_negation_b
+            and j >= 0.25
+        ):
+            return ComparisonResult(
+                mu_a_id=mu_a.mu_id,
+                mu_b_id=mu_b.mu_id,
+                relationship=RelationshipType.CONTRADICTION,
+                confidence=nli.contradiction,
+                reason=(
+                    f"NLI contradiction={nli.contradiction:.2f} + negation in B; "
+                    f"Jaccard={j:.2f}, entity_overlap={ent_ov}, same_topic={same_topic}"
+                ),
+            )
+
+        # --- 3. NLI entailment → SAME_FACT or UPDATED_FACT ---
+        # Guard: require SAME TOPIC before treating high-entailment claims as
+        # the same/updated fact.  Using entity overlap (ent_ov ≥ 1) as an OR
+        # bypass is intentionally removed — the DeBERTa NLI model returns high
+        # entailment for any two positive statements about the same person
+        # (e.g. "graduated from IIT" vs "works at Centific") because they share
+        # an implicit subject.  After cleaning generic words ("The", pronouns)
+        # from entity extraction the ent_ov signal is more reliable, but topic
+        # agreement is still required to prevent cross-domain supersession.
+        if nli.entailment >= _NLI_ENTAILMENT_THRESHOLD:
+            if not same_topic:
+                # High NLI entailment but different topics — the model is
+                # capturing a shared subject, not true semantic equivalence.
+                # Downgrade to RELATED; no supersession edge is written.
+                return ComparisonResult(
+                    mu_a_id=mu_a.mu_id,
+                    mu_b_id=mu_b.mu_id,
+                    relationship=RelationshipType.RELATED,
+                    confidence=nli.entailment * 0.5,
+                    reason=(
+                        f"NLI entailment={nli.entailment:.2f} but topic mismatch "
+                        f"({topic_a}≠{topic_b}); downgraded to RELATED"
+                    ),
+                )
+            # Within the same topic, an update verb means the newer claim
+            # supersedes rather than merely duplicates the older one.
+            if has_update:
+                return ComparisonResult(
+                    mu_a_id=mu_a.mu_id,
+                    mu_b_id=mu_b.mu_id,
+                    relationship=RelationshipType.UPDATED_FACT,
+                    confidence=nli.entailment,
+                    reason=(
+                        f"NLI entailment={nli.entailment:.2f} + update verb; "
+                        f"topic={topic_a}, entity_overlap={ent_ov}"
+                    ),
+                )
             return ComparisonResult(
                 mu_a_id=mu_a.mu_id,
                 mu_b_id=mu_b.mu_id,
                 relationship=RelationshipType.SAME_FACT,
-                confidence=min(1.0, j),
-                reason=f"high Jaccard={j:.2f}",
+                confidence=nli.entailment,
+                reason=(
+                    f"NLI entailment={nli.entailment:.2f}; topic={topic_a}, "
+                    f"Jaccard={j:.2f}, entity_overlap={ent_ov}"
+                ),
             )
 
-        # 2. CONTRADICTION — negation in newer + (high-j OR ≥2 shared entities)
-        #    AND at least one anchor: entity overlap OR same topic.
-        #    Conservative: requires substantial evidence to avoid false positives
-        #    from incidental shared tokens (e.g. "John likes pizza" vs
-        #    "John doesn't like sushi" share only the entity "John" and have
-        #    Jaccard < 0.25, so they correctly resolve to RELATED not CONTRADICTION).
-        has_negation = bool(_NEGATION_RE.search(claim_b))
-        if has_negation:
-            strong_overlap = j >= _CONTRADICTION_J or ent_ov >= _CONTRADICTION_ENTITY
-            anchored = ent_ov >= 1 or same_topic
-            if strong_overlap and anchored:
-                conf = min(1.0, 0.6 + 0.1 * min(ent_ov, 3) + 0.1 * float(same_topic))
-                return ComparisonResult(
-                    mu_a_id=mu_a.mu_id,
-                    mu_b_id=mu_b.mu_id,
-                    relationship=RelationshipType.CONTRADICTION,
-                    confidence=conf,
-                    reason=(
-                        f"negation in newer claim; Jaccard={j:.2f}, "
-                        f"entity_overlap={ent_ov}, same_topic={same_topic}"
-                    ),
-                )
+        # --- 4. NLI-neutral zone: rule-based categorisation ---
 
-        # 3. UPDATED_FACT — update verb in newer + topic or entity anchor
-        has_update = bool(_UPDATE_VERB_RE.search(claim_b))
-        if has_update and (same_topic or ent_ov >= 1):
+        # 4a. UPDATED_FACT — explicit update verb in newer claim.
+        # Requires same_topic: an update verb ("graduated from", "moved to",
+        # "joined") only supersedes facts within THE SAME life domain.
+        # Accepting ent_ov ≥ 1 as a bypass was the root cause of cross-topic
+        # supersession when "The" polluted the entity overlap signal.
+        if has_update and same_topic:
             return ComparisonResult(
                 mu_a_id=mu_a.mu_id,
                 mu_b_id=mu_b.mu_id,
                 relationship=RelationshipType.UPDATED_FACT,
                 confidence=0.75,
                 reason=(
-                    f"update verb in newer claim; same_topic={same_topic}, "
+                    f"update verb in newer claim; topic={topic_a} (same), "
                     f"entity_overlap={ent_ov}"
                 ),
             )
 
-        # 4. TEMPORAL_CHANGE — temporal marker in newer + topic or entity anchor
-        has_temporal = bool(_TEMPORAL_RE.search(claim_b))
-        if has_temporal and (same_topic or ent_ov >= 1):
+        # 4b. UPDATED_FACT (implicit) — same high-importance topic, different
+        #     named entities, low token overlap.  Catches "works at Centific" →
+        #     "works at Microsoft" without an explicit update verb.
+        _IMPLICIT_UPDATE_TOPICS = {"employment", "location", "relationships"}
+        if (
+            same_topic
+            and topic_a in _IMPLICIT_UPDATE_TOPICS
+            and j < _SAME_FACT_J
+            and j < 0.30
+            and len(ent_a) >= 1
+            and len(ent_b) >= 1
+            and _entity_overlap(ent_a, ent_b) == 0
+        ):
+            return ComparisonResult(
+                mu_a_id=mu_a.mu_id,
+                mu_b_id=mu_b.mu_id,
+                relationship=RelationshipType.UPDATED_FACT,
+                confidence=0.68,
+                reason=(
+                    f"implicit update: same topic '{topic_a}', different entities "
+                    f"({ent_a} → {ent_b}), Jaccard={j:.2f}"
+                ),
+            )
+
+        # 4c. TEMPORAL_CHANGE — temporal marker in newer claim.
+        # Requires same_topic for the same reason as 4a: "I used to play chess"
+        # should only create a temporal edge against other lifestyle/hobby facts,
+        # not against location or employment facts that happen to share an entity.
+        if has_temporal and same_topic:
             return ComparisonResult(
                 mu_a_id=mu_a.mu_id,
                 mu_b_id=mu_b.mu_id,
                 relationship=RelationshipType.TEMPORAL_CHANGE,
                 confidence=0.70,
                 reason=(
-                    f"temporal marker in newer claim; same_topic={same_topic}, "
+                    f"temporal marker in newer claim; topic={topic_a} (same), "
                     f"entity_overlap={ent_ov}"
                 ),
             )
 
-        # 5. RELATED
+        # 4d. RELATED — same topic or moderate token overlap
         if same_topic or j >= _RELATED_J:
             return ComparisonResult(
                 mu_a_id=mu_a.mu_id,
@@ -344,7 +494,7 @@ class ContradictionResolver:
                 reason=f"same_topic={same_topic}, Jaccard={j:.2f}",
             )
 
-        # 6. UNRELATED
+        # 4e. UNRELATED
         return ComparisonResult(
             mu_a_id=mu_a.mu_id,
             mu_b_id=mu_b.mu_id,

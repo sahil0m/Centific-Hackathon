@@ -6,7 +6,6 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from threading import Lock
-from typing import Final
 
 
 class RateLimitExceeded(Exception):

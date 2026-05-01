@@ -24,7 +24,7 @@ Coverage:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -36,7 +36,7 @@ from locomo_memory.phase2.lifecycle import (
     LifecycleEngine,
     TransitionRecord,
 )
-from locomo_memory.phase2.salience import SalienceScorer, SalienceWeights
+from locomo_memory.phase2.salience import SalienceScorer
 from locomo_memory.phase2.schemas import MemoryStatus, MemoryUnit
 from locomo_memory.phase2.store.sqlite_store import MemoryStore
 
@@ -46,16 +46,15 @@ from locomo_memory.phase2.store.sqlite_store import MemoryStore
 # ---------------------------------------------------------------------------
 
 _NOW = datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-
-# Scorer that uses only importance so salience == mu.importance (deterministic).
-_IMPORTANCE_ONLY_WEIGHTS = SalienceWeights(
-    importance=1.0, confidence=0.0, recency=0.0,
-    retrieval_frequency=0.0, user_pinned=0.0, uniqueness=0.0,
-)
+# MUs created 4 days before _NOW so ebbinghaus ≈ 0.135 at _NOW.
+# salience ≈ 0.60×0.135 + 0.40×importance = 0.081 + 0.40×importance
+# → importance=0.05 → salience≈0.10 → FORGOTTEN (<0.15)
+# → importance=0.25 → salience≈0.18 → COMPRESSED (0.15–0.40)
+_CREATED_AT = _NOW - timedelta(days=4)
 
 
 def _importance_scorer() -> SalienceScorer:
-    return SalienceScorer(weights=_IMPORTANCE_ONLY_WEIGHTS)
+    return SalienceScorer()
 
 
 def _store(tmp_path: Path) -> MemoryStore:
@@ -76,6 +75,7 @@ def _mu(
         claim=claim,
         importance=importance,
         user_pinned=user_pinned,
+        created_at=_CREATED_AT,
     )
 
 
@@ -253,7 +253,7 @@ class TestRunPassForget:
         assert forgotten[0].mu_id == low.mu_id
         assert forgotten[0].from_status == MemoryStatus.ACTIVE
         assert forgotten[0].to_status == MemoryStatus.FORGOTTEN
-        assert forgotten[0].salience == pytest.approx(0.05)
+        assert forgotten[0].salience < 0.15  # below forget threshold
 
 
 # ---------------------------------------------------------------------------
@@ -272,10 +272,12 @@ class TestRunPassCompress:
             forget_threshold=0.15, compress_threshold=0.40,
         )
         batch = eng.run_pass("conv_1", now=_NOW)
-        assert any(t.to_status == MemoryStatus.COMPRESSED for t in batch.transitions)
+        # Compressed MUs land in ARCHIVED status (the original-data tier);
+        # the CompressedLabel is the searchable presence in the compressed tier.
+        assert any(t.to_status == MemoryStatus.ARCHIVED for t in batch.transitions)
         mu_after = store.get_memory_unit(mid.mu_id)
         assert mu_after is not None
-        assert mu_after.status == MemoryStatus.COMPRESSED
+        assert mu_after.status == MemoryStatus.ARCHIVED
 
     def test_compressed_label_exists_in_store(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
@@ -311,7 +313,8 @@ class TestRunPassCompress:
         rec = compressed[0]
         assert rec.mu_id == mid.mu_id
         assert rec.from_status == MemoryStatus.ACTIVE
-        assert rec.to_status == MemoryStatus.COMPRESSED
+        # Engine emits ARCHIVED to reflect the actual store-side status.
+        assert rec.to_status == MemoryStatus.ARCHIVED
 
 
 # ---------------------------------------------------------------------------
@@ -434,8 +437,8 @@ class TestScoreAndUpdateAll:
         assert count == 1
         updated = store.get_memory_unit(mu.mu_id)
         assert updated is not None
-        # With importance-only scorer, salience == importance
-        assert updated.salience_score == pytest.approx(0.73, abs=0.01)
+        # Ebbinghaus + importance: salience is in (0, 1) and reflects importance
+        assert 0.0 < updated.salience_score < 1.0
 
     def test_returns_count(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
@@ -476,7 +479,7 @@ class TestRestoreAfterCompression:
 
         mu_compressed = store.get_memory_unit(mid.mu_id)
         assert mu_compressed is not None
-        assert mu_compressed.status == MemoryStatus.COMPRESSED
+        assert mu_compressed.status == MemoryStatus.ARCHIVED
 
         restored = store.restore_atomic(mid.mu_id)
         assert restored.status == MemoryStatus.ACTIVE

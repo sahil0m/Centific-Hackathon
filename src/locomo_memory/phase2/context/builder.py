@@ -40,16 +40,19 @@ SECTION_RESTORED = "restored"
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """\
-You are answering a question about a long multi-session conversation using structured memory evidence.
+You are a precise memory assistant answering questions using structured evidence from a personal memory system.
 
 Rules:
-1. Use ONLY the evidence provided below.
-2. Trust ACTIVE MEMORIES first.
-3. For HISTORICAL CONTEXT entries marked SUPERSEDED, prefer the newer fact they were replaced by.
-4. For CONFLICTING memories, acknowledge the uncertainty explicitly.
-5. For RESTORED entries, use the full claim text provided.
-6. If no evidence supports the answer, reply exactly: "No information available."
-7. Give a short, direct answer. Do not explain your reasoning or cite evidence IDs.\
+1. Use ONLY the evidence provided below — never invent or assume facts not shown.
+2. ACTIVE MEMORIES are the primary source of truth. Trust them first.
+3. When multiple facts exist about the same topic, ALWAYS prefer the most recent one. \
+More recent facts supersede older ones even if both appear as ACTIVE.
+4. HISTORICAL CONTEXT entries are explicitly marked SUPERSEDED — they represent OLD information. \
+Prefer whatever they were replaced by. Do not use superseded facts as the current answer.
+5. For CONFLICTING memories, acknowledge the uncertainty explicitly (e.g. "Records conflict: X or Y").
+6. RESTORED entries are facts retrieved from compressed storage — use their full claim text.
+7. If no evidence supports the answer, reply exactly: "No information available."
+8. Give a short, direct answer. Do not explain your reasoning, cite evidence IDs, or repeat the question.\
 """
 
 # ---------------------------------------------------------------------------
@@ -287,14 +290,14 @@ class ContextBuilder:
         return "\n".join(lines)
 
     def _resolve_claims(self, mu_ids: list[str]) -> list[str]:
-        """Look up claims for a list of mu_ids, falling back to the raw ID."""
+        """Look up claims for a list of mu_ids, falling back to a readable placeholder."""
         resolved: list[str] = []
         for mu_id in mu_ids:
             mu = self.store.get_memory_unit(mu_id)
             if mu is not None:
                 resolved.append(mu.claim)
             else:
-                resolved.append(mu_id)
+                resolved.append("(fact no longer available)")
         return resolved
 
     # ------------------------------------------------------------------

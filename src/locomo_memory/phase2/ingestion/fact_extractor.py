@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from dataclasses import dataclass, field
 from typing import ClassVar, Final
 
@@ -55,11 +54,54 @@ _importance_estimator = TopicImportanceEstimator()
 
 
 # ---------------------------------------------------------------------------
+# Hedge / speculation detector
+# ---------------------------------------------------------------------------
+# Even when the extractor LLM is told to skip hedged facts, it sometimes lets
+# weakly-asserted claims through ("The user might move to Mumbai", "The user
+# is thinking about quitting").  These should not enter memory at full
+# confidence — if accepted at 0.9 they can wrongly supersede well-established
+# facts ("The user lives in Hyderabad").
+#
+# Strategy: detect hedge markers in the extracted *claim* text and downgrade
+# the confidence to a configurable speculative_confidence (default 0.35).
+# A separate ``is_speculative`` signal is exposed via MU.confidence so that
+# the contradiction resolver and salience scorer can treat it appropriately
+# without requiring schema migration.
+_HEDGE_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b("
+    r"might|maybe|perhaps|possibly|probably|likely|unlikely|"
+    r"thinking\s+(about|of)|considering|may\s+(be|move|join|go|come|become)|"
+    r"could\s+(be|become|move|join|go|happen)|"
+    r"hopes?\s+to|wants?\s+to|wishes\s+to|plans?\s+to|intends?\s+to|"
+    r"expecting\s+to|going\s+to|about\s+to|"
+    r"\bif\b|unless|in\s+case"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Question-mark heuristic: any extracted claim ending in "?" was almost
+# certainly extracted from a question and should not be stored as a fact.
+_QUESTION_RE: Final[re.Pattern[str]] = re.compile(r"\?\s*$")
+
+
+def _is_speculative(claim: str) -> bool:
+    """Return True if the claim looks like a hedged/conditional statement."""
+    return bool(_HEDGE_RE.search(claim) or _QUESTION_RE.search(claim))
+
+
+def _confidence_for(claim: str, base_confidence: float, speculative: float) -> float:
+    """Clamp confidence down for speculative claims, leave others alone."""
+    if _is_speculative(claim):
+        return min(base_confidence, speculative)
+    return base_confidence
+
+
+# ---------------------------------------------------------------------------
 # Prompt construction
 # ---------------------------------------------------------------------------
 
 
-_BASE_TEMPLATE_VERSION: Final[str] = "extractor_v1"
+_BASE_TEMPLATE_VERSION: Final[str] = "extractor_v2"  # bumped: prompt now extracts preferences
 
 
 def _template_version(max_facts: int, model: str) -> str:
@@ -74,10 +116,17 @@ def _build_messages(chunk_text: str, max_facts: int) -> list[dict[str, str]]:
         "Rules:\n"
         "1. Each fact must be a complete, standalone statement (a single sentence).\n"
         "2. Resolve pronouns to full names where possible, using the speaker labels.\n"
-        "3. Skip questions, opinions, hedges (\"I think\", \"maybe\"), and pleasantries.\n"
-        "4. Skip meta-statements about the conversation itself (\"yeah\", \"ok\", \"right\").\n"
-        "5. Each fact must be self-contained and readable without other facts.\n"
-        f"6. Return AT MOST {max_facts} facts; pick the most informative.\n\n"
+        "3. EXTRACT preferences, hobbies, traits, relationships, jobs, locations, "
+        "education, and life events — these are valuable long-term memory:\n"
+        "   - \"I love chess\" → \"The speaker loves chess.\"\n"
+        "   - \"My favorite food is pizza\" → \"The speaker's favorite food is pizza.\"\n"
+        "   - \"I work at Google\" → \"The speaker works at Google.\"\n"
+        "   - \"My sister is Priya\" → \"The speaker's sister is named Priya.\"\n"
+        "4. SKIP only: questions, hedged speculation (\"I think it will rain\", "
+        "\"maybe X\"), and pure pleasantries (\"hi\", \"thanks\", \"ok\").\n"
+        "5. SKIP meta-statements about the conversation itself (\"yeah\", \"got it\").\n"
+        "6. Each fact must be self-contained and readable without other facts.\n"
+        f"7. Return AT MOST {max_facts} facts; pick the most informative.\n\n"
         "For each fact, attribute it to a speaker label that appears in the chunk, "
         "and (if you can identify a single source turn) the dialog ID of that turn.\n\n"
         "Return STRICT JSON ONLY. Do not include markdown fences, explanations, "
@@ -170,30 +219,30 @@ _OPINION_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+# Splits compound "I X and I Y" sentences into independent clauses.
+# Matches " and I ", " and my ", " but I " etc. — only when each half has a subject.
+_COMPOUND_SPLIT_RE = re.compile(r"\s+(?:and|but)\s+(?=i\s|my\s|we\s)", re.IGNORECASE)
+_CLAIM_MAX_CHARS = 300  # Truncate heuristic claims to prevent retrieval noise
 
 
 def _heuristic_facts(chunk: Chunk, max_facts: int) -> list[dict[str, str | None]]:
     """Sentence-level fallback. Lower-quality but always available.
 
-    Splits each turn body on sentence boundaries, drops obvious non-facts
-    (questions, opinion-prefixed statements, very short fragments), and
-    attributes each to the surrounding turn's speaker.
+    Splits on sentence boundaries and compound clauses, drops obvious non-facts
+    (questions, opinion-prefixed statements, very short fragments, very long
+    repetitive text), and attributes each to the surrounding turn's speaker.
     """
     out: list[dict[str, str | None]] = []
-    # Reconstruct per-turn (speaker, dia_id, text) by walking chunk metadata.
-    # The chunk text contains a header + one line per turn formatted as
-    # "Speaker [ts]: text" — but rather than re-parse, walk the parallel
-    # arrays we already have.
     n = max(len(chunk.dia_ids), len(chunk.speakers))
     if n == 0:
         return out
 
-    # We don't have per-turn raw text on the Chunk; the methodology accepts
-    # this — heuristic uses chunk-level granularity for source.
     body = chunk.text
     # Strip header line if present
     if body.startswith("[") and "\n" in body:
         body = body.split("\n", 1)[1]
+
+    seen_claims: set[str] = set()
 
     for line in body.split("\n"):
         if not line.strip():
@@ -205,22 +254,30 @@ def _heuristic_facts(chunk: Chunk, max_facts: int) -> list[dict[str, str | None]
             head = head.strip()
             if head and len(head) <= 80:
                 line_speaker = head
-                # "Alice [2024-01-01]" → take just the first token as the speaker label
                 line_speaker = line_speaker.split(" ", 1)[0]
                 line = rest.strip()
 
         for sentence in _SENTENCE_SPLIT_RE.split(line):
-            s = sentence.strip().rstrip(".")
-            if len(s) < 10:
-                continue
-            if s.endswith("?"):
-                continue
-            if _OPINION_PREFIX_RE.match(s):
-                continue
-            speaker = line_speaker if line_speaker in chunk.speakers else None
-            out.append({"claim": s, "speaker": speaker, "source_dia_id": None})
-            if len(out) >= max_facts:
-                return out
+            # Further split compound clauses ("I X and I Y" → two facts)
+            for clause in _COMPOUND_SPLIT_RE.split(sentence):
+                s = clause.strip().rstrip(".")
+                if len(s) < 10:
+                    continue
+                if s.endswith("?"):
+                    continue
+                if _OPINION_PREFIX_RE.match(s):
+                    continue
+                # Cap length — very long sentences are usually noise / repetitions
+                s = s[:_CLAIM_MAX_CHARS]
+                # Deduplicate within the heuristic result (repeated sentences)
+                key = re.sub(r"\s+", " ", s.lower())
+                if key in seen_claims:
+                    continue
+                seen_claims.add(key)
+                speaker = line_speaker if line_speaker in chunk.speakers else None
+                out.append({"claim": s, "speaker": speaker, "source_dia_id": None})
+                if len(out) >= max_facts:
+                    return out
     return out
 
 
@@ -272,6 +329,8 @@ class FactExtractor:
         retain_on_failure: bool = True,
         llm_confidence: float = 0.9,
         heuristic_confidence: float = 0.5,
+        speculative_confidence: float = 0.35,
+        drop_questions: bool = True,
     ) -> None:
         if max_facts_per_chunk < 1:
             raise ValueError(
@@ -285,6 +344,8 @@ class FactExtractor:
             raise ValueError("llm_confidence must be in [0,1]")
         if not 0.0 <= heuristic_confidence <= 1.0:
             raise ValueError("heuristic_confidence must be in [0,1]")
+        if not 0.0 <= speculative_confidence <= 1.0:
+            raise ValueError("speculative_confidence must be in [0,1]")
         if enable_llm and client is None:
             raise ValueError("client is required when enable_llm=True")
 
@@ -297,6 +358,14 @@ class FactExtractor:
         self.retain_on_failure = retain_on_failure
         self.llm_confidence = llm_confidence
         self.heuristic_confidence = heuristic_confidence
+        # Speculative / hedged claims (e.g. "the user might move to Mumbai")
+        # get this lower confidence so they cannot wrongly supersede a
+        # well-established fact downstream.
+        self.speculative_confidence = speculative_confidence
+        # Question-shaped extractions ("Where does the user live?") are almost
+        # always artifacts of the LLM mis-extracting from a user question.
+        # When True, drop them silently before they enter memory.
+        self.drop_questions = drop_questions
 
     # ------------------------------------------------------------------
     # Public API
@@ -384,8 +453,19 @@ class FactExtractor:
         for fact in parsed:
             claim = fact["claim"]
             assert isinstance(claim, str)  # _parse_facts_payload guarantees
+            # Drop question-shaped extractions outright — these are almost
+            # always the LLM mis-reading a user question as a fact.
+            if self.drop_questions and _QUESTION_RE.search(claim):
+                logger.debug(
+                    "Fact extractor: dropped question-shaped claim '{}'",
+                    claim[:60],
+                )
+                continue
             speaker, source_dia_ids, timestamp = self._resolve_provenance(
                 chunk, fact["speaker"], fact["source_dia_id"],
+            )
+            confidence = _confidence_for(
+                claim, self.llm_confidence, self.speculative_confidence,
             )
             try:
                 mu = MemoryUnit(
@@ -397,7 +477,7 @@ class FactExtractor:
                     source_speaker=speaker,
                     timestamp=timestamp,
                     importance=_importance_estimator.estimate(claim),
-                    confidence=self.llm_confidence,
+                    confidence=confidence,
                     status=MemoryStatus.ACTIVE,
                 )
             except ValidationError as exc:
@@ -415,8 +495,13 @@ class FactExtractor:
         for fact in parsed:
             claim = fact["claim"]
             assert isinstance(claim, str)
+            if self.drop_questions and _QUESTION_RE.search(claim):
+                continue
             speaker, source_dia_ids, timestamp = self._resolve_provenance(
                 chunk, fact["speaker"], fact["source_dia_id"],
+            )
+            confidence = _confidence_for(
+                claim, self.heuristic_confidence, self.speculative_confidence,
             )
             try:
                 mu = MemoryUnit(
@@ -428,7 +513,7 @@ class FactExtractor:
                     source_speaker=speaker,
                     timestamp=timestamp,
                     importance=_importance_estimator.estimate(claim),
-                    confidence=self.heuristic_confidence,
+                    confidence=confidence,
                     status=MemoryStatus.ACTIVE,
                 )
             except ValidationError as exc:

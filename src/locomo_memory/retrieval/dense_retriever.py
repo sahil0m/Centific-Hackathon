@@ -9,7 +9,6 @@ import logging
 import time
 from dataclasses import dataclass
 
-import numpy as np
 
 from locomo_memory.data.schemas import Chunk, RetrievedChunk
 from locomo_memory.indexing.embeddings import EmbeddingGenerator

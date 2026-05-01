@@ -1,37 +1,32 @@
-"""Salience Scorer — Phase 2 Milestone 4.
+"""Salience Scorer — Phase 2.
 
-Computes a salience score for MemoryUnit objects using a weighted combination
-of sub-scores derived from MU fields. Also exposes a utility metric
-(salience / storage_cost) that drives compression and forgetting decisions
-when memory approaches capacity.
+Research basis
+--------------
+Ebbinghaus forgetting curve applied to LLM memory
+(MemoryBank, Zhong et al. 2023):
 
-Sub-score dimensions
---------------------
-- **importance**: mu.importance — rule-based topic importance set by
-  :class:`~locomo_memory.phase2.ingestion.importance.TopicImportanceEstimator`
-  at ingestion time (not a constant).
-- **confidence**: mu.confidence (LLM-assigned or heuristic).
-- **recency**: exponential decay from last_accessed (or created_at).
-- **retrieval_frequency**: normalised mu.retrieval_count.
-- **user_pinned**: binary 1/0 bonus.
-- **uniqueness**: mu.uniqueness (set during ingestion).
+    retrievability = e^(-t / S)
 
-Formula
--------
-    weighted_sum = Σ weight_i * sub_score_i
-    salience     = clip(weighted_sum / Σ weight_i, 0, 1)
-    utility      = salience / storage_cost_factor(mu)
+where:
+    t = days since last access (or creation if never accessed)
+    S = memory stability = base_stability × 2^min(retrieval_count, 10)
 
-Weights do not need to sum to 1 — the scorer normalises them internally.
+Each retrieval doubles the stability, so a frequently-retrieved fact decays
+much more slowly than one that was never needed.
 
-Ranking and candidate helpers
-------------------------------
-:meth:`rank`, :meth:`candidates_for_compression`, and :meth:`utility` are
-*scoring helpers only*. They do not own or implement the capacity trigger.
+Combined with topic importance following the Generative Agents structure
+(Park et al. 2023):
 
-The active-memory capacity trigger (fire at 90 % fill, target 75 %) belongs
-to the :class:`~locomo_memory.phase2.lifecycle.engine.LifecycleEngine`, which
-calls these helpers to decide which MUs to transition.
+    salience = 0.60 × ebbinghaus + 0.40 × importance − graph_penalty
+
+Graph penalty is supplied by the caller (lifecycle engine) using edges
+already written by the ContradictionResolver:
+    SUPERSEDED_BY edge on this MU  →  −0.30  (fact is outdated)
+    CONFLICTS_WITH edge on this MU →  −0.10  (fact is contested)
+    penalty is capped at 0.40 so salience never goes below 0.
+
+The lifecycle engine sorts candidates by salience (ascending) to decide
+which MUs to evict first when the active store exceeds capacity.
 """
 
 from __future__ import annotations
@@ -39,7 +34,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Final
 
 from locomo_memory.phase2.schemas import MemoryUnit
 
@@ -48,59 +42,11 @@ from locomo_memory.phase2.schemas import MemoryUnit
 # Constants
 # ---------------------------------------------------------------------------
 
-_HALF_LIFE_DAYS_DEFAULT: Final[float] = 30.0
-_RETRIEVAL_NORM_DEFAULT: Final[int] = 10
-_STORAGE_BASELINE_CHARS: Final[int] = 100  # 100-char claim → cost factor 1.0
-
-
-# ---------------------------------------------------------------------------
-# Weights
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class SalienceWeights:
-    """Relative per-dimension weights for salience scoring.
-
-    Values are normalised internally so they do not need to sum to 1.
-    Every weight must be ≥ 0 and at least one must be > 0.
-    """
-
-    importance: float = 0.30
-    confidence: float = 0.15
-    recency: float = 0.20
-    retrieval_frequency: float = 0.15
-    user_pinned: float = 0.10
-    uniqueness: float = 0.10
-
-    def __post_init__(self) -> None:
-        values = self._values()
-        if any(v < 0.0 for v in values):
-            raise ValueError(
-                f"All SalienceWeights must be >= 0; got {dict(zip(self._names(), values))}"
-            )
-        if sum(values) == 0.0:
-            raise ValueError("At least one SalienceWeight must be > 0")
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _names(self) -> tuple[str, ...]:
-        return (
-            "importance", "confidence", "recency",
-            "retrieval_frequency", "user_pinned", "uniqueness",
-        )
-
-    def _values(self) -> tuple[float, ...]:
-        return (
-            self.importance, self.confidence, self.recency,
-            self.retrieval_frequency, self.user_pinned, self.uniqueness,
-        )
-
-    @property
-    def total(self) -> float:
-        return sum(self._values())
+_MAX_RETRIEVAL_CAP: int = 10
+_EBBINGHAUS_WEIGHT: float = 0.60
+_IMPORTANCE_WEIGHT: float = 0.40
+_DEFAULT_BASE_STABILITY: float = 2.0
+_MAX_GRAPH_PENALTY: float = 0.40
 
 
 # ---------------------------------------------------------------------------
@@ -110,12 +56,18 @@ class SalienceWeights:
 
 @dataclass(slots=True)
 class SalienceResult:
-    """Full breakdown of a single salience computation."""
+    """Full breakdown of a single salience computation.
+
+    Attributes:
+        mu_id: ID of the scored MemoryUnit.
+        salience: final score in [0, 1].
+        graph_penalty: penalty applied from contradiction-resolver edges.
+        sub_scores: {"ebbinghaus": float, "importance": float}
+    """
 
     mu_id: str
     salience: float
-    utility: float
-    storage_cost_factor: float
+    graph_penalty: float
     sub_scores: dict[str, float] = field(default_factory=dict)
 
 
@@ -125,35 +77,20 @@ class SalienceResult:
 
 
 class SalienceScorer:
-    """Compute salience scores for MemoryUnit objects.
+    """Compute salience scores using the Ebbinghaus forgetting curve.
 
     Args:
-        weights: per-dimension weights (normalised internally). Pass
-            ``None`` to use the balanced defaults in :class:`SalienceWeights`.
-        half_life_days: recency decay time constant. A MU last accessed
-            ``half_life_days`` ago gets recency = 0.5.
-        retrieval_normalization: retrieval count at which the retrieval
-            sub-score reaches 0.5. Acts as a saturation knee.
+        base_stability: memory stability S for a never-retrieved fact.
+            Each retrieval doubles S (up to 2^10 cap), so a fact retrieved
+            N times has S = base_stability × 2^min(N, 10).
+            Default 2.0 gives a half-life of ~1.4 days for a new fact and
+            ~44 days after 5 retrievals.
     """
 
-    def __init__(
-        self,
-        weights: SalienceWeights | None = None,
-        *,
-        half_life_days: float = _HALF_LIFE_DAYS_DEFAULT,
-        retrieval_normalization: int = _RETRIEVAL_NORM_DEFAULT,
-    ) -> None:
-        if half_life_days <= 0.0:
-            raise ValueError(
-                f"half_life_days must be > 0, got {half_life_days}"
-            )
-        if retrieval_normalization < 1:
-            raise ValueError(
-                f"retrieval_normalization must be >= 1, got {retrieval_normalization}"
-            )
-        self.weights = weights or SalienceWeights()
-        self.half_life_days = half_life_days
-        self.retrieval_normalization = retrieval_normalization
+    def __init__(self, *, base_stability: float = _DEFAULT_BASE_STABILITY) -> None:
+        if base_stability <= 0.0:
+            raise ValueError(f"base_stability must be > 0, got {base_stability}")
+        self.base_stability = base_stability
 
     # ------------------------------------------------------------------
     # Public API
@@ -164,18 +101,28 @@ class SalienceScorer:
         mu: MemoryUnit,
         *,
         now: datetime | None = None,
+        graph_penalty: float = 0.0,
     ) -> float:
-        """Return salience score in [0, 1]."""
-        return self._compute(mu, now=_resolve_now(now)).salience
+        """Return salience score in [0, 1].
+
+        Args:
+            mu: the MemoryUnit to score.
+            now: reference timestamp (defaults to UTC now).
+            graph_penalty: pre-computed penalty from contradiction-resolver
+                edges (0.30 for SUPERSEDED_BY, 0.10 for CONFLICTS_WITH).
+                Capped internally at 0.40.
+        """
+        return self._compute(mu, now=_resolve_now(now), graph_penalty=graph_penalty).salience
 
     def score_and_update(
         self,
         mu: MemoryUnit,
         *,
         now: datetime | None = None,
+        graph_penalty: float = 0.0,
     ) -> float:
-        """Compute salience score and write it back to ``mu.salience_score``."""
-        s = self.score(mu, now=now)
+        """Compute salience and write the result back to ``mu.salience_score``."""
+        s = self.score(mu, now=now, graph_penalty=graph_penalty)
         mu.salience_score = s
         return s
 
@@ -184,37 +131,31 @@ class SalienceScorer:
         mu: MemoryUnit,
         *,
         now: datetime | None = None,
+        graph_penalty: float = 0.0,
     ) -> SalienceResult:
-        """Return a full :class:`SalienceResult` with all sub-scores."""
-        return self._compute(mu, now=_resolve_now(now))
-
-    def utility(
-        self,
-        mu: MemoryUnit,
-        *,
-        now: datetime | None = None,
-    ) -> float:
-        """Return utility = salience / storage_cost_factor.
-
-        Lower utility ⟹ first candidate for compression or forgetting.
-        """
-        return self._compute(mu, now=_resolve_now(now)).utility
+        """Return a full :class:`SalienceResult` with sub-scores."""
+        return self._compute(mu, now=_resolve_now(now), graph_penalty=graph_penalty)
 
     def rank(
         self,
         mus: list[MemoryUnit],
         *,
         now: datetime | None = None,
-        by_utility: bool = False,
+        penalties: dict[str, float] | None = None,
     ) -> list[MemoryUnit]:
-        """Return MUs sorted highest-first by salience (or utility)."""
+        """Return MUs sorted highest-first by salience.
+
+        Args:
+            penalties: optional mapping of mu_id → graph_penalty pre-computed
+                from contradiction-resolver edges.
+        """
         resolved = _resolve_now(now)
-        key = (
-            (lambda mu: self._compute(mu, now=resolved).utility)
-            if by_utility
-            else (lambda mu: self._compute(mu, now=resolved).salience)
+        p = penalties or {}
+        return sorted(
+            mus,
+            key=lambda mu: self._compute(mu, now=resolved, graph_penalty=p.get(mu.mu_id, 0.0)).salience,
+            reverse=True,
         )
-        return sorted(mus, key=key, reverse=True)
 
     def candidates_for_compression(
         self,
@@ -222,96 +163,80 @@ class SalienceScorer:
         *,
         threshold: float = 0.4,
         now: datetime | None = None,
-        by_utility: bool = False,
+        penalties: dict[str, float] | None = None,
     ) -> list[MemoryUnit]:
-        """Return MUs below ``threshold``, sorted ascending (compress first).
-
-        This is a *scoring helper only* — it performs no capacity check and
-        executes no state transitions. The Lifecycle Engine owns the 90%
-        capacity trigger and calls this method to identify candidates.
+        """Return MUs below ``threshold``, sorted ascending (evict first).
 
         Pinned MUs are always excluded regardless of score.
 
         Args:
-            mus: candidate pool.
-            threshold: score/utility ceiling for inclusion (exclusive upper bound).
-            now: reference timestamp for recency; defaults to UTC now.
-            by_utility: if True, compare utility instead of salience.
+            threshold: salience ceiling for inclusion (exclusive upper bound).
+            penalties: optional mapping of mu_id → graph_penalty.
 
         Raises:
             ValueError: if threshold is outside [0, 1].
         """
         if not 0.0 <= threshold <= 1.0:
-            raise ValueError(
-                f"threshold must be in [0, 1], got {threshold}"
-            )
+            raise ValueError(f"threshold must be in [0, 1], got {threshold}")
         resolved = _resolve_now(now)
+        p = penalties or {}
         candidates: list[tuple[float, MemoryUnit]] = []
         for mu in mus:
             if mu.user_pinned:
                 continue
-            result = self._compute(mu, now=resolved)
-            val = result.utility if by_utility else result.salience
-            if val < threshold:
-                candidates.append((val, mu))
-        # Ascending: lowest score first (most urgently compress/forgotten).
+            s = self._compute(mu, now=resolved, graph_penalty=p.get(mu.mu_id, 0.0)).salience
+            if s < threshold:
+                candidates.append((s, mu))
         return [mu for _, mu in sorted(candidates, key=lambda t: t[0])]
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
-    def _compute(self, mu: MemoryUnit, *, now: datetime) -> SalienceResult:
-        w = self.weights
+    def _compute(
+        self,
+        mu: MemoryUnit,
+        *,
+        now: datetime,
+        graph_penalty: float,
+    ) -> SalienceResult:
+        # --- Ebbinghaus: retrievability = e^(-t / S) ---
+        # Defensive: both timestamps are normally set by the schema's
+        # ``default_factory=utcnow``, but a manually-constructed MU or a
+        # corrupt DB row could have them as None.  Rather than crashing
+        # with AttributeError on ``ref.tzinfo``, fall back to ``now`` which
+        # gives ebbinghaus = 1.0 (treated as freshly-created).  Same idea
+        # for clock skew: if ``ref`` is in the future, ``max(0.0, …)``
+        # already clamps t to 0 below, so we don't need a separate guard.
+        ref = mu.last_accessed or mu.created_at or now
+        if ref.tzinfo is None:
+            ref = ref.replace(tzinfo=timezone.utc)
+        t = max(0.0, (now - ref).total_seconds() / 86_400.0)
+        # Retrieval count must be a non-negative integer; clamp defensively
+        # against negative values that would invert the stability curve.
+        rc = max(0, int(mu.retrieval_count or 0))
+        S = self.base_stability * (2.0 ** min(rc, _MAX_RETRIEVAL_CAP))
+        ebbinghaus = math.exp(-t / S)
 
-        sub: dict[str, float] = {
-            "importance": _clamp(mu.importance),
-            "confidence": _clamp(mu.confidence),
-            "recency": self._recency(mu, now),
-            "retrieval_frequency": self._retrieval_frequency(mu),
-            "user_pinned": 1.0 if mu.user_pinned else 0.0,
-            "uniqueness": _clamp(mu.uniqueness),
-        }
+        # --- Topic importance (set by TopicImportanceEstimator at ingestion) ---
+        importance = max(0.0, min(1.0, mu.importance))
 
-        weighted_sum = (
-            w.importance         * sub["importance"]
-            + w.confidence       * sub["confidence"]
-            + w.recency          * sub["recency"]
-            + w.retrieval_frequency * sub["retrieval_frequency"]
-            + w.user_pinned      * sub["user_pinned"]
-            + w.uniqueness       * sub["uniqueness"]
-        )
+        # --- Graph penalty (contradiction resolver edges) ---
+        penalty = max(0.0, min(_MAX_GRAPH_PENALTY, graph_penalty))
 
-        salience = _clamp(weighted_sum / w.total)
-        cost = self._storage_cost(mu)
-        utility = salience / cost
+        # --- Combine ---
+        raw = _EBBINGHAUS_WEIGHT * ebbinghaus + _IMPORTANCE_WEIGHT * importance
+        salience = round(max(0.0, min(1.0, raw - penalty)), 4)
 
         return SalienceResult(
             mu_id=mu.mu_id,
             salience=salience,
-            utility=utility,
-            storage_cost_factor=cost,
-            sub_scores=sub,
+            graph_penalty=penalty,
+            sub_scores={
+                "ebbinghaus": round(ebbinghaus, 4),
+                "importance": round(importance, 4),
+            },
         )
-
-    def _recency(self, mu: MemoryUnit, now: datetime) -> float:
-        """Exponential decay from last access (or creation) to now."""
-        ref = mu.last_accessed or mu.created_at
-        if ref.tzinfo is None:
-            ref = ref.replace(tzinfo=timezone.utc)
-        age_days = max(0.0, (now - ref).total_seconds() / 86_400.0)
-        decay_k = math.log(2.0) / self.half_life_days
-        return math.exp(-decay_k * age_days)
-
-    def _retrieval_frequency(self, mu: MemoryUnit) -> float:
-        """Normalised retrieval count via n/(n+k) saturation curve."""
-        n = mu.retrieval_count
-        k = self.retrieval_normalization
-        return n / (n + k)
-
-    def _storage_cost(self, mu: MemoryUnit) -> float:
-        """Cost factor ≥ 1.0; baseline = 100 characters of claim text."""
-        return max(1.0, len(mu.claim) / _STORAGE_BASELINE_CHARS)
 
 
 # ---------------------------------------------------------------------------
@@ -327,12 +252,8 @@ def _resolve_now(now: datetime | None) -> datetime:
     return now
 
 
-def _clamp(v: float) -> float:
-    return max(0.0, min(1.0, v))
-
-
 # ---------------------------------------------------------------------------
 # Re-exports
 # ---------------------------------------------------------------------------
 
-__all__ = ["SalienceResult", "SalienceScorer", "SalienceWeights"]
+__all__ = ["SalienceResult", "SalienceScorer"]

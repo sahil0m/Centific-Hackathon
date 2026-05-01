@@ -340,6 +340,8 @@ class TestMemoryStatus:
         assert len(values) == len(list(MemoryStatus))
 
     def test_expected_states_present(self) -> None:
-        expected = {"active", "compressed", "archived", "forgotten", "deleted"}
+        # User-initiated deletion is hard-delete (row removed + audit row);
+        # the 4 remaining lifecycle states cover every visible MU.
+        expected = {"active", "compressed", "archived", "forgotten"}
         actual = {s.value for s in MemoryStatus}
         assert expected == actual

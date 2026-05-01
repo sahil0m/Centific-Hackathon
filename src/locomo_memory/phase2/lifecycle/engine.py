@@ -3,24 +3,45 @@
 Owns the active-memory capacity trigger and orchestrates state transitions
 when a conversation's memory store approaches its configured cap.
 
-Transition policy
------------------
+Cap-driven eviction policy
+--------------------------
+The cap is the law. The eviction set is determined by *how many* MUs must
+leave Active to bring pressure to ``target_pressure_pct``, not by absolute
+salience thresholds. This guarantees the cap is honored even when every
+active MU scores above the compress threshold (the "all > 0.40" case).
+
+Algorithm (one pass):
+
 1. Check ``store.storage_pressure(conv_id, config.active_cap)``.
 2. If pressure < ``config.transition_trigger_pct`` (default 0.90) → no-op.
-3. Score every active MU using :class:`~locomo_memory.phase2.salience.SalienceScorer`.
-4. Rank non-pinned MUs by salience ascending (lowest first).
-5. Transition MUs until pressure drops below ``config.target_pressure_pct`` (0.70):
-   - salience < ``config.salience_forget_threshold`` (0.15) → FORGOTTEN
-   - else                                                   → COMPRESSED
-6. Compressed MUs get a rule-based :class:`CompressedLabel` + :class:`ArchivedEntry`
-   (built by :class:`LabelBuilder`, no LLM call needed).
+3. Score every active MU with the
+   :class:`~locomo_memory.phase2.salience.SalienceScorer`.
+4. Filter out user-pinned MUs (always protected, regardless of score).
+5. Sort remaining candidates by **eviction priority key**, ascending —
+   lowest priority gets evicted first:
+        key = ( salience , last_access_ts )
+   ``last_access_ts`` is the recency tiebreaker (older = evicted first).
+6. Take the bottom ``n_to_transition = active_count - target_count`` from
+   the sorted list. This always frees enough room to hit the target.
+7. For each evicted MU, choose its *destination* using salience thresholds
+   (these only decide where it lands, not whether it leaves):
+       - salience < ``salience_forget_threshold`` (default 0.15) → FORGOTTEN
+       - otherwise                                              → ARCHIVED
+         (with a searchable :class:`CompressedLabel` + an
+         :class:`ArchivedEntry` snapshot built by :class:`LabelBuilder`,
+         no LLM call needed)
 
-Capacity trigger constant
--------------------------
-    transition_trigger_pct = 0.90  (fire at 90 % fill)
-    target_pressure_pct    = 0.70  (compress until below 70 %)
+Why this scales
+---------------
+- The cap → target ratios are *fractional*, so the methodology behaves
+  identically at cap=10 or cap=50_000.
+- Sorting + bottom-N selection is O(n log n) on the active set, never
+  the entire memory store.
+- Pinning is honored by exclusion, never by partial sort overrides.
+- Recency is folded in as the secondary key, so untouched stale facts
+  drain out before recently-accessed ones at the same salience band.
 
-User-pinned MUs are never transitioned by the engine, regardless of salience.
+User-pinned MUs are never evicted by the engine.
 """
 
 from __future__ import annotations
@@ -35,15 +56,14 @@ from typing import Final
 from loguru import logger
 
 from locomo_memory.phase2.ingestion.importance import TopicImportanceEstimator
-from locomo_memory.phase2.salience.scorer import SalienceScorer, SalienceWeights
+from locomo_memory.phase2.salience.scorer import SalienceScorer
 from locomo_memory.phase2.schemas import (
     ArchivedEntry,
     CompressedLabel,
+    EdgeType,
     MemoryStatus,
     MemoryUnit,
     new_archive_id,
-    new_label_id,
-    utcnow,
 )
 from locomo_memory.phase2.store.sqlite_store import (
     IllegalStateTransitionError,
@@ -149,7 +169,15 @@ class LifecycleBatch:
 
     @property
     def n_compressed(self) -> int:
-        return sum(1 for t in self.transitions if t.to_status == MemoryStatus.COMPRESSED)
+        """Count of MUs sent to the compressed tier (ARCHIVED status + label).
+
+        Includes legacy COMPRESSED transitions for backward compatibility
+        with older batch records still present in audit trails.
+        """
+        return sum(
+            1 for t in self.transitions
+            if t.to_status in (MemoryStatus.ARCHIVED, MemoryStatus.COMPRESSED)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +236,7 @@ class LifecycleEngine:
         scorer: the :class:`SalienceScorer` used to rank MUs. Pass ``None``
             to use a default scorer with balanced weights.
         config: lifecycle tuning parameters. Pass ``None`` for defaults
-            (trigger at 90 %, target 75 %, cap 500).
+            (trigger at 90 %, target 70 %, cap 500).
         label_builder: rule-based label factory. Pass ``None`` to use the
             default :class:`LabelBuilder`.
     """
@@ -266,31 +294,46 @@ class LifecycleEngine:
         *,
         now: datetime | None = None,
     ) -> LifecycleBatch:
-        """Unconditionally run one compression pass for a conversation.
+        """Unconditionally run one cap-driven eviction pass.
 
-        Scores all active MUs, then transitions the lowest-salience
-        non-pinned ones until pressure drops below ``target_pressure_pct``.
+        Scores all active MUs, filters out pinned ones, ranks the remainder
+        by ``(salience, last_accessed)`` ascending, and transitions the
+        bottom ``active_count - target_count`` until pressure drops below
+        ``target_pressure_pct``. Threshold values only choose the
+        *destination* (FORGOTTEN vs ARCHIVED), never eligibility — so the
+        cap is honored even when every active MU scores above the compress
+        threshold.
         """
         resolved = _resolve_now(now)
         active_mus = self.store.list_active(conversation_id)
-        pressure_before = len(active_mus) / max(1, self.config.active_cap)
+        n_active = len(active_mus)
+        # pressure_before = raw active count / cap (used for logging + return value)
+        pressure_before = n_active / max(1, self.config.active_cap)
 
-        n_scored = len(active_mus)
+        n_scored = n_active
+        # Pre-compute graph penalties from contradiction-resolver edges so the
+        # salience scorer can factor in superseded/conflicted status.
+        penalties = _compute_graph_penalties(self.store, [mu.mu_id for mu in active_mus])
         scored: list[tuple[float, MemoryUnit]] = [
-            (self.scorer.score(mu, now=resolved), mu)
+            (self.scorer.score(mu, now=resolved, graph_penalty=penalties.get(mu.mu_id, 0.0)), mu)
             for mu in active_mus
         ]
-        # Sort ascending: lowest salience first = highest compression priority
-        scored.sort(key=lambda t: t[0])
 
-        n_active = len(active_mus)
-        target_active = math.floor(self.config.target_pressure_pct * self.config.active_cap)
-        n_to_transition = max(0, n_active - target_active)
+        # Eviction priority key, ascending → bottom of the list goes first.
+        # Pinned MUs are excluded entirely (never evicted by the engine).
+        eligible = [(s, mu) for s, mu in scored if not mu.user_pinned]
+        eligible.sort(key=lambda t: _eviction_priority_key(t[0], t[1]))
 
-        # Only non-pinned candidates
-        candidates = [
-            (s, mu) for s, mu in scored if not mu.user_pinned
-        ][:n_to_transition]
+        target_active = math.floor(
+            self.config.target_pressure_pct * self.config.active_cap
+        )
+        # n_to_transition is capped by number of eligible (non-pinned) MUs so we
+        # never try to evict more than what's available.
+        n_to_transition = min(
+            max(0, n_active - target_active),
+            len(eligible),
+        )
+        candidates = eligible[:n_to_transition]
 
         transitions: list[TransitionRecord] = []
         errors: list[str] = []
@@ -310,14 +353,25 @@ class LifecycleEngine:
         n_remaining = n_active - n_transitioned
         pressure_after = n_remaining / max(1, self.config.active_cap)
 
+        n_pinned_skipped = n_active - len(eligible)
         logger.info(
-            "Lifecycle pass conv={}: scored={} forgotten={} compressed={} "
-            "pressure {:.2%} → {:.2%}",
-            conversation_id, n_scored,
+            "Lifecycle pass conv={}: scored={} pinned_skipped={} forgotten={} "
+            "compressed={} pressure {:.2%} → {:.2%}",
+            conversation_id, n_scored, n_pinned_skipped,
             sum(1 for t in transitions if t.to_status == MemoryStatus.FORGOTTEN),
-            sum(1 for t in transitions if t.to_status == MemoryStatus.COMPRESSED),
+            sum(
+                1 for t in transitions
+                if t.to_status in (MemoryStatus.ARCHIVED, MemoryStatus.COMPRESSED)
+            ),
             pressure_before, pressure_after,
         )
+        if n_to_transition > len(candidates):
+            logger.warning(
+                "Lifecycle conv={}: cap pressure cannot fully drain — wanted to "
+                "evict {} but only {} non-pinned MUs available. Pin density is "
+                "preventing target_pressure_pct from being reached.",
+                conversation_id, n_to_transition, len(candidates),
+            )
 
         return LifecycleBatch(
             conversation_id=conversation_id,
@@ -379,10 +433,13 @@ class LifecycleEngine:
     ) -> None:
         label, archive = self.label_builder.build(mu)
         self.store.compress_atomic(mu.mu_id, label, archive)
+        # The store moves the MU to ARCHIVED status (the original-data tier);
+        # the searchable presence in the compressed tier is the new
+        # CompressedLabel pointing at this archived snapshot.
         transitions.append(TransitionRecord(
             mu_id=mu.mu_id,
             from_status=MemoryStatus.ACTIVE,
-            to_status=MemoryStatus.COMPRESSED,
+            to_status=MemoryStatus.ARCHIVED,
             salience=salience,
             reason="compress",
         ))
@@ -403,6 +460,59 @@ def _resolve_now(now: datetime | None) -> datetime:
     if now.tzinfo is None:
         return now.replace(tzinfo=timezone.utc)
     return now
+
+
+# Sentinel for MUs that have never been retrieved/accessed. Used as a
+# numeric stand-in for last_accessed in the eviction sort so unaccessed
+# MUs sort earlier (= evicted first) than recently-accessed ones.
+_NEVER_ACCESSED_SENTINEL: Final[float] = 0.0
+
+
+def _eviction_priority_key(salience: float, mu: MemoryUnit) -> tuple[float, float, str]:
+    """Compute the eviction priority key for one MU.
+
+    Lower tuple = higher priority for eviction (sorted ascending, bottom-N
+    are removed first).
+
+    Components, in order of dominance:
+    1. ``salience`` — Ebbinghaus + importance score; lower salience leaves first.
+    2. ``last_accessed_ts`` — recency tiebreaker; older MUs leave first on ties.
+    3. ``mu_id`` — final deterministic tiebreaker so the order is fully
+       reproducible across runs / SQLite implementations / Python versions
+       even when the first two components are exactly equal.
+
+    Pinned MUs must be filtered before this key is consulted.
+    """
+    if mu.last_accessed is not None:
+        last_ts = mu.last_accessed.timestamp()
+    elif mu.created_at is not None:
+        last_ts = mu.created_at.timestamp()
+    else:
+        last_ts = _NEVER_ACCESSED_SENTINEL
+    return (salience, last_ts, mu.mu_id)
+
+
+def _compute_graph_penalties(
+    store: "MemoryStore",
+    mu_ids: list[str],
+) -> dict[str, float]:
+    """Return a mapping of mu_id → graph penalty for the scorer.
+
+    Uses edges already written by the ContradictionResolver:
+        SUPERSEDED_BY on this MU  → 0.30 (fact is outdated)
+        CONFLICTS_WITH on this MU → 0.10 (fact is contested)
+    Penalties are additive and capped at 0.40.
+    """
+    penalties: dict[str, float] = {}
+    for mu_id in mu_ids:
+        p = 0.0
+        if store.edges_from(mu_id, EdgeType.SUPERSEDED_BY):
+            p += 0.30
+        if store.edges_from(mu_id, EdgeType.CONFLICTS_WITH):
+            p += 0.10
+        if p > 0.0:
+            penalties[mu_id] = min(p, 0.40)
+    return penalties
 
 
 # ---------------------------------------------------------------------------

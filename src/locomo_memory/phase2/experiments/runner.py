@@ -38,7 +38,6 @@ from locomo_memory.phase2.context.guard import ResponseGuard
 from locomo_memory.phase2.experiments.config import Phase2RunnerConfig
 from locomo_memory.phase2.experiments.evaluator import (
     Phase2Evaluator,
-    Phase2Metrics,
     Phase2PredictionRow,
     Phase2RunResult,
 )
@@ -412,21 +411,32 @@ class Phase2LoCoMoRunner:
     # ------------------------------------------------------------------
 
     def _generate_answer(self, question: str, built_context: Any) -> str:
-        """Call the answer LLM.  Override or mock in subclasses / tests."""
+        """Call the answer LLM via OpenRouterClient (uses OPENROUTER_API_KEY)."""
         try:
-            from locomo_memory.generation.llm_client import LLMClient  # type: ignore[import]
-            client = LLMClient(
-                provider=self.config.generation.provider,
-                model_name=self.config.generation.model_name,
-                temperature=self.config.generation.temperature,
-                max_tokens=self.config.generation.max_output_tokens,
-                cache_dir=self.config.generation.cache_dir,
-            )
+            import hashlib, os
+            from locomo_memory.phase2.llm.client import OpenRouterClient
+            from locomo_memory.phase2.llm.cache import LLMCache
+
+            api_key = os.environ.get("OPENROUTER_API_KEY", "")
+            cache_dir = getattr(self.config.generation, "cache_dir", None) or "data/processed/llm_cache"
+            cache = LLMCache(str(cache_dir), size_limit_bytes=10 * 1024 * 1024 * 1024)
+            client = OpenRouterClient(api_key=api_key, cache=cache)
+
             user_msg = f"{built_context.rendered_text}\n\nQuestion:\n{question}\n\nAnswer:"
-            return client.generate(
-                system_prompt=built_context.system_prompt,
-                user_message=user_msg,
+            cache_input = hashlib.sha256((question + built_context.rendered_text).encode()).hexdigest()[:20]
+
+            response = client.chat_completion(
+                model=self.config.generation.model_name,
+                messages=[
+                    {"role": "system", "content": built_context.system_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                prompt_template_version="answer_v1",
+                cache_input=cache_input,
+                max_tokens=self.config.generation.max_output_tokens,
+                temperature=self.config.generation.temperature,
             )
+            return response.content.strip()
         except Exception as exc:
             logger.warning("Answer generation failed ({}): {}", type(exc).__name__, exc)
             return ""

@@ -1,10 +1,55 @@
-# Long-Horizon Conversational Memory — Phase 1: Naive RAG Baseline
+# Long-Horizon Conversational Memory — Phase 2: SPARC-LTM
 
-This repository implements a **professional, reproducible naive vector-RAG baseline** over the [LoCoMo](https://github.com/snap-research/locomo) long-horizon conversational memory benchmark.
+This repository implements **SPARC-LTM** (Salience and Provenance Aware Reconciliation and Compression for Long-Term Memory) — a production-grade memory layer for LLM agents — alongside the **Phase 1 naive vector-RAG baseline** that anchors its evaluation.
 
-> This is the naive vector-RAG baseline required before implementing the advanced long-horizon memory method. It treats all message chunks equally and retrieves by vector similarity only. Later, the proposed method will add salience-aware forgetting, compression under a hard storage cap, contradiction reconciliation with provenance, and a memory inspection UI.
+For full design details, see [`METHODOLOGY.md`](METHODOLOGY.md). For the original build brief, see [`CLAUDE.md`](CLAUDE.md).
 
 ---
+
+## Quick Start (Phase 2 — SPARC-LTM Streamlit demo)
+
+```bash
+# 1. Install
+pip install -e .
+
+# 2. Provide an OpenRouter API key in .env
+cp .env.example .env
+# edit .env to add OPENROUTER_API_KEY=sk-or-...
+
+# 3. Launch the interactive memory demo
+streamlit run app.py
+```
+
+In the Streamlit UI:
+- **Click "🚀 Demo (cap=10)"** to enable demo-mode lifecycle thresholds (visible in ~2 minutes)
+- Send statements ("I work at Centific", "I live in Hyderabad") → they enter Active memory
+- Watch the memory bar populate Active / Compressed / Archived / Forgotten layers
+- Send updates ("I moved to Mumbai") → see automatic supersession with provenance
+- Open **Memory Inspector** to browse every fact + its full provenance trail
+
+## Quick Start (Phase 2 — full LoCoMo evaluation)
+
+```bash
+python -m locomo_memory.experiments.run_full_system_eval \
+  --config configs/phase2_full_system_eval.yaml
+```
+
+Outputs land in `results/phase2/`. See [§14 of METHODOLOGY.md](METHODOLOGY.md#14-comparison-with-the-phase-1-naive-rag-baseline) for what this measures.
+
+## Quick Start (Phase 1 — naive RAG baseline)
+
+```bash
+python -m locomo_memory.experiments.run_rag_qa \
+  --config configs/naive_rag_turn_top5.yaml
+```
+
+The Phase 1 baseline is what Phase 2 is measured against. Both ship in this repo.
+
+---
+
+## What Phase 1 Does
+
+
 
 ## What Phase 1 Does
 

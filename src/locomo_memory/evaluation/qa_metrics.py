@@ -13,7 +13,6 @@ from __future__ import annotations
 import re
 import string
 from collections import Counter
-from typing import Optional
 
 
 def normalize_answer(text: str) -> str:
@@ -83,7 +82,6 @@ def compute_latency_percentiles(
 ) -> dict[str, float]:
     if not latency_ms_list:
         return {"p50": 0.0, "p95": 0.0}
-    import statistics
     sorted_lat = sorted(latency_ms_list)
     n = len(sorted_lat)
     p50_idx = max(0, int(0.50 * n) - 1)

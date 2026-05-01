@@ -113,7 +113,9 @@ class TestCompressHappyPath:
         svc.compress(mu.mu_id)
         updated = store.get_memory_unit(mu.mu_id)
         assert updated is not None
-        assert updated.status == MemoryStatus.COMPRESSED
+        # New design: compressed MU sits in ARCHIVED status with a CompressedLabel
+        # acting as the searchable pointer in the compressed tier.
+        assert updated.status == MemoryStatus.ARCHIVED
 
     def test_label_exists_in_store(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
@@ -378,7 +380,7 @@ class TestPeekArchive:
         svc.peek_archive(mu.mu_id)
         still_compressed = store.get_memory_unit(mu.mu_id)
         assert still_compressed is not None
-        assert still_compressed.status == MemoryStatus.COMPRESSED
+        assert still_compressed.status == MemoryStatus.ARCHIVED
 
     def test_non_compressed_mu_returns_none(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
@@ -538,9 +540,11 @@ class TestStats:
 
         stats = svc.stats("conv_1")
         assert stats.active == 3
-        assert stats.compressed == 2
+        # Compressed MUs now live in ARCHIVED status (the original-data tier);
+        # the legacy COMPRESSED bucket is reserved for pre-migration label rows.
+        assert stats.archived == 2
+        assert stats.compressed == 0
         assert stats.forgotten == 1
-        assert stats.deleted == 0
 
     def test_total_property(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
@@ -548,7 +552,7 @@ class TestStats:
         for _ in range(4):
             _active_mu(store)
         stats = svc.stats("conv_1")
-        assert stats.total == stats.active + stats.compressed + stats.forgotten + stats.archived + stats.deleted
+        assert stats.total == stats.active + stats.compressed + stats.forgotten + stats.archived
 
     def test_scoped_to_conversation(self, tmp_path: Path) -> None:
         store = _store(tmp_path)

@@ -359,10 +359,13 @@ class TestContextBuilderRendering:
         assert "Alice works at Microsoft" in ctx.rendered_text
 
     def test_superseded_entry_falls_back_to_id(self, store, builder):
-        # m99 not in store — should fall back to the raw ID
+        # m99 not in store — the renderer surfaces a friendly placeholder
+        # rather than leaking the raw ID into the LLM prompt. Both forms
+        # signal "the linked fact has been deleted/forgotten" without
+        # confusing the model with a bare opaque ID.
         hit = _hit(_mu("old fact", mu_id="m1"), superseded_by=["m99"])
         ctx = builder.build("query", [hit])
-        assert "m99" in ctx.rendered_text
+        assert "fact no longer available" in ctx.rendered_text
 
     def test_conflicted_entry_shows_conflicts_with(self, store):
         conf_mu = _mu("Alice dislikes cats", mu_id="m2")

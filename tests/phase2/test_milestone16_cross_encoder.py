@@ -79,12 +79,13 @@ def _make_retriever(tmp_path: Path, mus: list[MemoryUnit], fake_ce=None):
     bm25_idx = MemoryBM25Index()
     label_idx = CompressedLabelFAISSIndex(embed_fn=embed_fn, dim=DIM, normalize=True)
 
-    active = [m for m in mus if m.status != MemoryStatus.DELETED]
+    # All MUs are inserted as-is; tests that need a hard-deleted MU should
+    # call ``store.delete_atomic`` after ``_make_retriever`` returns.
     for mu in mus:
         store.insert_memory_unit(mu)
-    if active:
-        faiss_idx.add_mus(active)
-        bm25_idx.add_mus(active)
+    if mus:
+        faiss_idx.add_mus(mus)
+        bm25_idx.add_mus(mus)
 
     retriever = HybridMemoryRetriever(
         store=store,
@@ -256,9 +257,10 @@ class TestCrossEncoderIntegration:
 
     def test_deleted_memories_never_returned(self, tmp_path):
         mu_alive = _make_mu("alive", "Alice is alive", dia_id="D1")
-        mu_dead = _make_mu("dead", "Alice is deleted", dia_id="D2",
-                           status=MemoryStatus.DELETED)
+        mu_dead = _make_mu("dead", "Alice is deleted", dia_id="D2")
         retriever = _make_retriever(tmp_path, [mu_alive, mu_dead])
+        # Hard-delete the row; retriever must skip vector hits whose MU is gone.
+        retriever.store.delete_atomic("dead", deleted_by="test")
         result = retriever.retrieve(
             "Alice deleted alive", conversation_id="c1", config_override=_CE_CFG
         )

@@ -27,7 +27,7 @@ import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from loguru import logger
@@ -179,10 +179,10 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
 
 CURRENT_SCHEMA_VERSION = 1
 
-# Placeholder text written to claim/original_text on permanent deletion.
-# Keeps the row valid against the MemoryUnit schema (claim has min_length=1)
-# while clearly signalling that the original content has been removed.
-DELETED_PLACEHOLDER = "[deleted]"
+# Defensive cap on retrieval_count to prevent unbounded growth on MUs that
+# get retrieved millions of times.  The salience scorer saturates at 2^10
+# anyway, so this only affects the stored column value — never the score.
+_RETRIEVAL_COUNT_CAP = 1_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +214,11 @@ class MemoryStore:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("PRAGMA foreign_keys = ON")
+        # Resilience to concurrent writes: WAL allows parallel reads but writers
+        # serialize.  Without busy_timeout, two simultaneous writes fail
+        # immediately with "database is locked".  Wait up to 5s before erroring
+        # so brief contention (e.g. two Streamlit reruns) is absorbed silently.
+        conn.execute("PRAGMA busy_timeout = 5000")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -390,17 +395,24 @@ class MemoryStore:
             raise MemoryUnitNotFoundError(mu_id)
 
     def increment_retrieval_count(self, mu_id: str) -> None:
-        """Atomically increment retrieval_count and bump ``last_accessed``."""
+        """Atomically increment retrieval_count and bump ``last_accessed``.
+
+        Retrieval count is capped at ``_RETRIEVAL_COUNT_CAP`` (1_000_000).
+        The salience scorer already saturates at retrieval_count = 10
+        (stability cap of 2^10), so anything past that cap has no effect on
+        scoring — we just stop the column from drifting toward int overflow
+        on a multi-year-old MU that gets retrieved millions of times.
+        """
         with self.transaction() as conn:
             cursor = conn.execute(
                 """
                 UPDATE memory_units
-                   SET retrieval_count = retrieval_count + 1,
+                   SET retrieval_count = MIN(retrieval_count + 1, ?),
                        last_accessed = ?,
                        updated_at = ?
                  WHERE mu_id = ?
                 """,
-                (_utcnow_iso(), _utcnow_iso(), mu_id),
+                (_RETRIEVAL_COUNT_CAP, _utcnow_iso(), _utcnow_iso(), mu_id),
             )
             if cursor.rowcount == 0:
                 raise MemoryUnitNotFoundError(mu_id)
@@ -457,6 +469,31 @@ class MemoryStore:
             except ValueError:
                 logger.warning("Unknown status string in DB: {}", row["status"])
         return result
+
+    def count_archived_by_type(self, conversation_id: str) -> tuple[int, int]:
+        """Return (lifecycle_compressed_count, superseded_count) for ARCHIVED MUs.
+
+        Lifecycle-compressed MUs have a compressed_label_id (they went through
+        the capacity-driven eviction path and have a searchable CompressedLabel).
+        Superseded MUs have no compressed_label_id (they were archived because a
+        newer, contradicting fact replaced them).
+        """
+        with self.reader() as conn:
+            rows = conn.execute(
+                "SELECT (compressed_label_id IS NOT NULL) AS has_label, COUNT(*) AS n "
+                "FROM memory_units "
+                "WHERE conversation_id = ? AND status = ? "
+                "GROUP BY has_label",
+                (conversation_id, MemoryStatus.ARCHIVED.value),
+            ).fetchall()
+        compressed = 0
+        superseded = 0
+        for row in rows:
+            if row["has_label"]:
+                compressed += row["n"]
+            else:
+                superseded += row["n"]
+        return compressed, superseded
 
     def storage_pressure(self, conversation_id: str, cap: int) -> float:
         """Active MU count divided by cap. Returns 0.0 if cap <= 0."""
@@ -742,12 +779,15 @@ class MemoryStore:
                 )
             self._insert_archive(conn, archive)
             self._insert_label(conn, label)
+            # Original MU moves to ARCHIVED — the raw data recovery layer.
+            # The CompressedLabel row IS the "compressed tier"; querying via
+            # label_index returns the ARCHIVED MU's full claim from the archive.
             self._update_status(
-                conn, mu_id, MemoryStatus.COMPRESSED,
+                conn, mu_id, MemoryStatus.ARCHIVED,
                 label.label_id, archive.archived_entry_id,
             )
             logger.info(
-                "Compressed mu_id={} (label={}, archive={})",
+                "Compressed mu_id={} → ARCHIVED (label={}, archive={})",
                 mu_id, label.label_id, archive.archived_entry_id,
             )
 
@@ -771,10 +811,12 @@ class MemoryStore:
             if row is None:
                 raise MemoryUnitNotFoundError(mu_id)
             mu = _row_to_mu(row)
-            if mu.status != MemoryStatus.COMPRESSED:
+            # Accept both ARCHIVED (new design: original MU stored in archive layer)
+            # and COMPRESSED (legacy rows from before the schema change).
+            if mu.status not in (MemoryStatus.ARCHIVED, MemoryStatus.COMPRESSED):
                 raise IllegalStateTransitionError(
                     f"cannot restore MU in status {mu.status.value}; "
-                    "only compressed MUs are restorable via this path"
+                    "only archived/compressed MUs are restorable via this path"
                 )
             label_id = mu.compressed_label_id
             archive_id = mu.archived_entry_id
@@ -827,7 +869,6 @@ class MemoryStore:
 
         Raises:
             MemoryUnitNotFoundError: if the MU does not exist.
-            IllegalStateTransitionError: if the MU is currently DELETED.
         """
         with self.transaction() as conn:
             row = conn.execute(
@@ -836,10 +877,6 @@ class MemoryStore:
             if row is None:
                 raise MemoryUnitNotFoundError(mu_id)
             mu = _row_to_mu(row)
-            if mu.status == MemoryStatus.DELETED:
-                raise IllegalStateTransitionError(
-                    "cannot forget a deleted MU; deletion is terminal"
-                )
             if mu.status == MemoryStatus.FORGOTTEN:
                 return  # idempotent
 
@@ -906,28 +943,122 @@ class MemoryStore:
             ).fetchone()
             return _row_to_mu(updated)
 
-    def delete_atomic(self, mu_id: str, deleted_by: str = "user") -> None:
-        """Permanently delete a MU. The ONLY path to true deletion.
+    def increment_label_access(self, label_id: str) -> None:
+        """Atomically bump retrieval_count and last_label_match on a CompressedLabel.
 
-        - Status → DELETED, content fields nulled out.
-        - Audit row inserted in deletion_audit.
-        - Linked label + archive removed.
-        - Edges referencing this MU removed.
-        - Idempotent on already-deleted MUs.
+        Called whenever a label-lane hit is surfaced to the user so the decay
+        policy knows this compressed memory is still being used.
+        """
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE compressed_labels
+                   SET retrieval_count = retrieval_count + 1,
+                       last_label_match = ?
+                 WHERE label_id = ?
+                """,
+                (_utcnow_iso(), label_id),
+            )
+
+    def promote_archived_to_active(self, mu_id: str) -> MemoryUnit:
+        """Auto-promote an ARCHIVED MU back to ACTIVE when it is used in a response.
+
+        This implements the Compressed→Active transition triggered by retrieval use.
+        Equivalent to ``restore_atomic`` but named explicitly for the auto-promotion
+        code path so logs and metrics can distinguish manual vs. automatic restoration.
+        """
+        return self.restore_atomic(mu_id)
+
+    def compressed_decay_pass(
+        self,
+        conversation_id: str,
+        *,
+        max_idle_days: int = 30,
+    ) -> int:
+        """Decay stale ARCHIVED (compressed) MUs to FORGOTTEN.
+
+        A label is considered stale when it has not been matched by any retrieval
+        query for more than *max_idle_days* days.  The reference clock is:
+        - ``last_label_match`` when the label has ever been accessed, or
+        - ``compressed_at``   for labels that were never accessed.
+
+        For each stale label:
+        1. Move the corresponding ARCHIVED MU to FORGOTTEN (via forget_atomic,
+           which also cleans up label + archive rows in the same transaction).
+        2. Log the decay event.
+
+        Returns the number of MUs that were moved to FORGOTTEN.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_idle_days)
+
+        with self.reader() as conn:
+            rows = conn.execute(
+                """
+                SELECT mu_id, label_id, last_label_match, compressed_at
+                  FROM compressed_labels
+                 WHERE conversation_id = ?
+                """,
+                (conversation_id,),
+            ).fetchall()
+
+        stale_mu_ids: list[str] = []
+        for row in rows:
+            last_match = _parse_iso_or_none(row["last_label_match"])
+            compressed_at = _parse_iso(row["compressed_at"])
+            reference_time = last_match if last_match is not None else compressed_at
+            if reference_time < cutoff:
+                stale_mu_ids.append(row["mu_id"])
+
+        decayed = 0
+        for mu_id in stale_mu_ids:
+            try:
+                self.forget_atomic(mu_id)
+                decayed += 1
+                logger.info(
+                    "compressed_decay_pass: ARCHIVED→FORGOTTEN mu={} (idle >{} days)",
+                    mu_id, max_idle_days,
+                )
+            except Exception as exc:
+                logger.warning("compressed_decay_pass: failed for mu={}: {}", mu_id, exc)
+
+        if decayed:
+            logger.info(
+                "compressed_decay_pass: conv={} decayed={} (threshold={}d)",
+                conversation_id, decayed, max_idle_days,
+            )
+        return decayed
+
+    def delete_atomic(self, mu_id: str, deleted_by: str = "user") -> None:
+        """Permanently hard-delete a MU. The ONLY path to true deletion.
+
+        - The ``memory_units`` row itself is removed from the table.
+        - An audit row is inserted in ``deletion_audit`` (the only surviving
+          trace of the original MU, used for compliance reporting).
+        - Linked compressed label + archive snapshot are removed.
+        - Edges referencing this MU on either side are removed.
+        - Idempotent: a no-op if the MU has already been hard-deleted.
 
         Raises:
-            MemoryUnitNotFoundError: if the MU does not exist.
+            (none) — missing MU is treated as already-deleted (idempotent),
+            consistent with audit-driven deletion semantics where the row
+            may have been purged by an earlier concurrent caller.
         """
         with self.transaction() as conn:
             row = conn.execute(
                 "SELECT * FROM memory_units WHERE mu_id = ?", (mu_id,)
             ).fetchone()
             if row is None:
+                # Already hard-deleted (or never existed). Audit-only path
+                # keeps callers idempotent and avoids surfacing race errors.
+                already = conn.execute(
+                    "SELECT 1 FROM deletion_audit WHERE mu_id = ? LIMIT 1",
+                    (mu_id,),
+                ).fetchone()
+                if already is not None:
+                    return
                 raise MemoryUnitNotFoundError(mu_id)
-            mu = _row_to_mu(row)
-            if mu.status == MemoryStatus.DELETED:
-                return  # idempotent
 
+            mu = _row_to_mu(row)
             label_id = mu.compressed_label_id
             archive_id = mu.archived_entry_id
 
@@ -941,27 +1072,6 @@ class MemoryStore:
                     mu.mu_id, mu.conversation_id,
                     json.dumps(mu.source_dia_ids),
                     _utcnow_iso(), deleted_by,
-                ),
-            )
-
-            conn.execute(
-                """
-                UPDATE memory_units
-                   SET status = ?,
-                       claim = ?,
-                       original_text = ?,
-                       compressed_label_id = NULL,
-                       archived_entry_id = NULL,
-                       needs_reindex = 1,
-                       updated_at = ?
-                 WHERE mu_id = ?
-                """,
-                (
-                    MemoryStatus.DELETED.value,
-                    DELETED_PLACEHOLDER,
-                    DELETED_PLACEHOLDER,
-                    _utcnow_iso(),
-                    mu_id,
                 ),
             )
 
@@ -980,7 +1090,9 @@ class MemoryStore:
                 (mu_id, mu_id),
             )
 
-            logger.info("Deleted mu_id={} by {}", mu_id, deleted_by)
+            conn.execute("DELETE FROM memory_units WHERE mu_id = ?", (mu_id,))
+
+            logger.info("Hard-deleted mu_id={} by {}", mu_id, deleted_by)
 
     def list_deletion_audit(
         self, conversation_id: str | None = None
@@ -1003,6 +1115,32 @@ class MemoryStore:
 # ---------------------------------------------------------------------------
 
 
+def _safe_json_list(raw: str | None, *, field: str = "?") -> list:
+    """Decode a JSON-encoded list column, returning [] on any decode error.
+
+    Hardens row converters against malformed JSON written by an older code
+    version, manual DB edits, or partial writes.  The previous behaviour was
+    to crash the entire ``list_*`` query on a single corrupt row; this
+    isolates the damage to that row's column.
+    """
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return parsed
+        logger.warning(
+            "Row converter: expected JSON list for {} but got {}; using []",
+            field, type(parsed).__name__,
+        )
+        return []
+    except (json.JSONDecodeError, TypeError) as exc:
+        logger.warning(
+            "Row converter: malformed JSON in {} ({}); using []", field, exc,
+        )
+        return []
+
+
 def _row_to_mu(row: sqlite3.Row) -> MemoryUnit:
     return MemoryUnit(
         mu_id=row["mu_id"],
@@ -1010,7 +1148,7 @@ def _row_to_mu(row: sqlite3.Row) -> MemoryUnit:
         session_id=row["session_id"],
         claim=row["claim"],
         original_text=row["original_text"],
-        source_dia_ids=json.loads(row["source_dia_ids"]),
+        source_dia_ids=_safe_json_list(row["source_dia_ids"], field="source_dia_ids"),
         source_speaker=row["source_speaker"],
         timestamp=row["timestamp"],
         extracted_at=_parse_iso(row["extracted_at"]),
@@ -1040,9 +1178,9 @@ def _row_to_label(row: sqlite3.Row) -> CompressedLabel:
         conversation_id=row["conversation_id"],
         topic=row["topic"],
         short_summary=row["short_summary"],
-        key_entities=json.loads(row["key_entities"]),
+        key_entities=_safe_json_list(row["key_entities"], field="key_entities"),
         time_range=row["time_range"],
-        original_dia_ids=json.loads(row["original_dia_ids"]),
+        original_dia_ids=_safe_json_list(row["original_dia_ids"], field="original_dia_ids"),
         compressed_at=_parse_iso(row["compressed_at"]),
         retrieval_count=row["retrieval_count"],
         last_label_match=_parse_iso_or_none(row["last_label_match"]),
@@ -1079,7 +1217,7 @@ def _row_to_audit(row: sqlite3.Row) -> DeletionAudit:
         audit_id=row["audit_id"],
         mu_id=row["mu_id"],
         conversation_id=row["conversation_id"],
-        source_dia_ids=json.loads(row["source_dia_ids"]),
+        source_dia_ids=_safe_json_list(row["source_dia_ids"], field="source_dia_ids"),
         deleted_at=_parse_iso(row["deleted_at"]),
         deleted_by=row["deleted_by"],
     )

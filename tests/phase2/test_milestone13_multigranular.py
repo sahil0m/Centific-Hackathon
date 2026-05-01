@@ -405,8 +405,8 @@ class TestRRFFusion:
         assert se_hits[0].source_evidence_dia_ids == ["d_unlinked"]
 
     def test_deleted_mu_not_returned_via_source_evidence(self, _store):
-        """A source turn linked to a DELETED MU must never be returned."""
-        from locomo_memory.phase2.schemas import MemoryStatus, MemoryUnit
+        """A source turn linked to a hard-deleted MU must never be returned."""
+        from locomo_memory.phase2.schemas import MemoryUnit
 
         mu_deleted = MemoryUnit(
             mu_id="mu_deleted_1",
@@ -414,9 +414,10 @@ class TestRRFFusion:
             session_id="s1",
             claim="This content was deleted",
             source_dia_ids=["d_del"],
-            status=MemoryStatus.DELETED,
         )
         _store.insert_memory_unit(mu_deleted)
+        # Hard-delete: row is removed; only the audit row survives.
+        _store.delete_atomic("mu_deleted_1", deleted_by="test")
 
         se_idx = SourceEvidenceIndex()
         se_idx.add_turns([_turn("d_del", "deleted content appears here")])

@@ -11,10 +11,16 @@ build/
 venv/
 *.egg
 
-# data (large files)
+# data (large files / runtime artifacts)
 data/raw/*.json
 data/raw/*.jsonl
 data/processed/
+data/system/
+data/system/*.db
+data/system/*.db-shm
+data/system/*.db-wal
+data/system/llm_cache/
+llm_cache/
 
 # results (generated, not source)
 results/raw_predictions/
@@ -23,10 +29,17 @@ results/metrics/
 results/tables/
 results/reports/
 results/logs/
+results/phase2/
 
 # caches
 .cache/
+.pytest_cache/
 *.faiss
+
+# logs (Streamlit, app, training)
+*.log
+streamlit.log
+streamlit_*.log
 
 # IDE
 .vscode/

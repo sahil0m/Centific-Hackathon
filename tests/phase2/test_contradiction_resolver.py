@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from locomo_memory.phase2.contradiction.nli_classifier import FakeNLIClassifier
 from locomo_memory.phase2.contradiction.resolver import (
     ComparisonResult,
     ContradictionResolver,
@@ -36,7 +37,7 @@ def store(tmp_path: Path) -> MemoryStore:
 
 @pytest.fixture()
 def resolver(store: MemoryStore) -> ContradictionResolver:
-    return ContradictionResolver(store)
+    return ContradictionResolver(store, nli_classifier=FakeNLIClassifier())
 
 
 def _mu(

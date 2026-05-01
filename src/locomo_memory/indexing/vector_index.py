@@ -13,7 +13,6 @@ from __future__ import annotations
 import logging
 import pickle
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 

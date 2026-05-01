@@ -19,7 +19,7 @@ Deleted memories are **never** returned.
 from __future__ import annotations
 
 import time
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from loguru import logger
@@ -41,9 +41,9 @@ from locomo_memory.phase2.store.sqlite_store import MemoryStore
 # ---------------------------------------------------------------------------
 
 _GRAPH_SCORE_DISCOUNT: float = 0.8
+# SUPERSEDED_BY intentionally excluded: following it would boost old/buried facts
 _GRAPH_EXPAND_EDGE_TYPES: tuple[EdgeType, ...] = (
     EdgeType.RELATED_TO,
-    EdgeType.SUPERSEDED_BY,
     EdgeType.CONFLICTS_WITH,
 )
 
@@ -331,11 +331,15 @@ class HybridMemoryRetriever:
             source: str,
             label_summary: str | None = None,
             weight: float = 1.0,
+            salience: float = 0.0,
         ) -> None:
             contribution = weight / (cfg.rrf_k + rank)
             if mu_id not in rrf_map:
-                rrf_map[mu_id] = {"rrf": 0.0, "sources": [], "label_summary": None}
+                rrf_map[mu_id] = {"rrf": 0.0, "sources": [], "label_summary": None, "salience": salience}
             rrf_map[mu_id]["rrf"] += contribution
+            # Keep highest salience seen (newer facts have higher recency in salience)
+            if salience > rrf_map[mu_id].get("salience", 0.0):
+                rrf_map[mu_id]["salience"] = salience
             if source not in rrf_map[mu_id]["sources"]:
                 rrf_map[mu_id]["sources"].append(source)
             if label_summary is not None and rrf_map[mu_id]["label_summary"] is None:
@@ -353,13 +357,16 @@ class HybridMemoryRetriever:
             mu_id = res.mu_id
             # Verify the MU exists and is COMPRESSED (label should be linked to it)
             mu = self.store.get_memory_unit(mu_id)
-            if mu is None or mu.status == MemoryStatus.DELETED:
+            if mu is None:
+                # MU was hard-deleted (row removed from memory_units); skip.
                 continue
-            if mu.status != MemoryStatus.COMPRESSED:
-                # Label exists but MU was restored/forgotten; skip gracefully
+            # Accept ARCHIVED (new: original MU in archive layer) and COMPRESSED
+            # (legacy rows created before the ARCHIVED-status migration).
+            if mu.status not in (MemoryStatus.ARCHIVED, MemoryStatus.COMPRESSED):
+                # Label exists but MU was already restored or forgotten; skip.
                 continue
             label_mu_map[mu_id] = res.short_summary
-            _add_rrf(mu_id, res.rank, "label", label_summary=res.short_summary)
+            _add_rrf(mu_id, res.rank, "label", label_summary=res.short_summary, salience=mu.salience_score)
 
         # ---- Worker 4 results: Forgotten → feed into RRF ---------------
         for i, h in enumerate(forgotten_hits_raw, start=1):
@@ -412,9 +419,12 @@ class HybridMemoryRetriever:
                     )
                     se_no_mu_map[virtual_id] = se_hit
 
-        # ---- Hydrate MUs, apply DELETED filter --------------------------
+        # ---- Hydrate MUs, drop missing rows -----------------------------
+        # Sort: primary = RRF score desc, secondary = salience desc (recency tiebreaker)
         hits_pool: list[tuple[str, dict]] = sorted(
-            rrf_map.items(), key=lambda kv: kv[1]["rrf"], reverse=True
+            rrf_map.items(),
+            key=lambda kv: (kv[1]["rrf"], kv[1].get("salience", 0.0)),
+            reverse=True,
         )
 
         # Determine hydration pool size.  CE needs a larger set than top_k.
@@ -446,15 +456,25 @@ class HybridMemoryRetriever:
                 continue
 
             mu = self.store.get_memory_unit(mu_id)
-            if mu is None or mu.status == MemoryStatus.DELETED:
+            if mu is None:
+                # Hard-deleted between index hit and hydration; skip.
                 continue
             # ACTIVE and COMPRESSED (via label) are valid by default.
             # FORGOTTEN is allowed only when worker 4 contributed to this mu_id.
             if mu.status == MemoryStatus.FORGOTTEN and "forgotten" not in meta["sources"]:
                 continue
 
-            is_label_hit = mu_id in label_mu_map and mu.status == MemoryStatus.COMPRESSED
+            is_label_hit = mu_id in label_mu_map and mu.status in (
+                MemoryStatus.ARCHIVED, MemoryStatus.COMPRESSED
+            )
             label_summary = meta["label_summary"]
+
+            # Record label access so the decay clock resets on use.
+            if is_label_hit and mu.compressed_label_id:
+                try:
+                    self.store.increment_label_access(mu.compressed_label_id)
+                except Exception:
+                    pass  # advisory — never fail retrieval
 
             # Pointer follow: when a compressed label matched, load the full
             # archived MU and use it as the hit's memory unit.  This injects
@@ -482,9 +502,56 @@ class HybridMemoryRetriever:
                 source_evidence_dia_ids=se_mu_dia_map.get(mu_id, []),
             ))
 
+        # ---- Salience tiebreaker (recency): within similar RRF scores, newer facts win ---
+        ranked_hits.sort(
+            key=lambda h: h.rrf_score + 1e-4 * h.mu.salience_score,
+            reverse=True,
+        )
+
+        # ---- Freshness guard: drop hits replaced by a newer hit in the set ---
+        # If hit A has been SUPERSEDED_BY hit B and B is also in ranked_hits,
+        # A is stale information — keeping it in the answer context risks the
+        # LLM presenting outdated facts.  We always prefer the newer claim.
+        # This guard is intentionally narrow: we only drop A when the fresher B
+        # is *also* retrieved.  If B is not in the result set, A is kept (the
+        # caller may still want historical context) but tagged so the prompt
+        # builder can present it under [HISTORICAL].
+        if ranked_hits:
+            present_ids = {h.mu.mu_id for h in ranked_hits}
+            kept: list[HybridHit] = []
+            n_dropped = 0
+            for h in ranked_hits:
+                superseded_targets = list(getattr(h.relation_meta, "superseded_by", []) or [])
+                fresher_present = [t for t in superseded_targets if t in present_ids]
+                if fresher_present:
+                    n_dropped += 1
+                    logger.debug(
+                        "HybridRetriever: drop stale mu={} (superseded by {} in hit set)",
+                        h.mu.mu_id[:12], ",".join(t[:12] for t in fresher_present),
+                    )
+                    continue
+                kept.append(h)
+            if n_dropped:
+                logger.info(
+                    "HybridRetriever: freshness guard dropped {} stale hit(s)", n_dropped,
+                )
+            ranked_hits = kept
+
         # ---- Cross-encoder reranking / simple truncation ---------------
+        # Graceful degradation: if the CE model fails to load or score (e.g.
+        # offline, OOM, missing weights), we MUST NOT take down the whole
+        # retrieval call.  Fall back to RRF-ordered top-k truncation, which
+        # is the same path used when CE is disabled.  This keeps `ask()`
+        # functional under any single-component outage.
         if cfg.enable_cross_encoder and ranked_hits:
-            ranked_hits = self._cross_encoder_rerank(query, ranked_hits, cfg)
+            try:
+                ranked_hits = self._cross_encoder_rerank(query, ranked_hits, cfg)
+            except Exception as exc:
+                logger.warning(
+                    "HybridRetriever: cross-encoder rerank failed ({}); "
+                    "falling back to RRF-only top-k.", exc,
+                )
+                ranked_hits = ranked_hits[: cfg.top_k]
         else:
             ranked_hits = ranked_hits[: cfg.top_k]
 
@@ -513,6 +580,39 @@ class HybridMemoryRetriever:
                         hit.mu.mu_id, _exc,
                     )
 
+        # ---- Auto-promote ARCHIVED (compressed) hits that reached final top-k --
+        # A label-lane hit that makes it into top-k means the original full-detail
+        # memory is needed again.  Promote it ARCHIVED→ACTIVE so subsequent
+        # queries find it directly via FAISS/BM25 without going through the label
+        # tier.  The lifecycle engine will re-compress it if pressure rises again.
+        n_archived_promoted = 0
+        for hit in ranked_hits:
+            if not hit.is_from_label:
+                continue
+            # The hit.mu here may be the archived snapshot (status=ACTIVE in JSON)
+            # rather than the live DB row.  Re-fetch the live row to confirm status.
+            live_mu = self.store.get_memory_unit(hit.mu.mu_id)
+            if live_mu is None or live_mu.status not in (
+                MemoryStatus.ARCHIVED, MemoryStatus.COMPRESSED
+            ):
+                continue
+            try:
+                promoted_mu = self.store.promote_archived_to_active(hit.mu.mu_id)
+                hit.mu = promoted_mu
+                hit.is_from_label = False  # now a first-class active hit
+                self.faiss_index.add_mu(promoted_mu)
+                self.bm25_index.add_mu(promoted_mu)
+                n_archived_promoted += 1
+                logger.info(
+                    "HybridRetriever: archived mu={} auto-promoted to active (label hit)",
+                    promoted_mu.mu_id,
+                )
+            except Exception as _exc:
+                logger.warning(
+                    "HybridRetriever: could not promote archived mu={}: {}",
+                    hit.mu.mu_id, _exc,
+                )
+
         # ---- Assign final ranks -----------------------------------------
         for i, hit in enumerate(ranked_hits, start=1):
             hit.rank = i
@@ -520,11 +620,12 @@ class HybridMemoryRetriever:
         latency_ms = (time.perf_counter() - t0) * 1000
         logger.info(
             "HybridMemoryRetriever: conv={} top_k={} faiss={} bm25={} labels={} "
-            "forgotten_found={} promoted={} source_ev={} final={} latency={:.1f}ms",
+            "forgotten_found={} promoted_forgotten={} promoted_archived={} "
+            "source_ev={} final={} latency={:.1f}ms",
             conversation_id, cfg.top_k,
             len(faiss_results), len(bm25_results), len(label_results),
-            len(forgotten_hits_raw), n_promoted, se_hit_count, len(ranked_hits),
-            latency_ms,
+            len(forgotten_hits_raw), n_promoted, n_archived_promoted,
+            se_hit_count, len(ranked_hits), latency_ms,
         )
 
         return HybridRetrievalResult(
@@ -656,7 +757,6 @@ class HybridMemoryRetriever:
                     mu = self.store.get_memory_unit(nbr_id)
                     if (
                         mu is None
-                        or mu.status == MemoryStatus.DELETED
                         or mu.status == MemoryStatus.FORGOTTEN
                         or mu.conversation_id != conversation_id
                     ):
@@ -684,7 +784,8 @@ class HybridMemoryRetriever:
         hits: list[HybridHit] = []
         for res in results:
             mu = self.store.get_memory_unit(res.mu_id)
-            if mu is None or mu.status == MemoryStatus.DELETED:
+            if mu is None:
+                # Hard-deleted; skip.
                 continue
             relation_meta = self._build_relation_meta(res.mu_id)
             hits.append(HybridHit(

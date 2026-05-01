@@ -21,7 +21,6 @@ from locomo_memory.phase2.schemas import (
     MemoryUnit,
 )
 from locomo_memory.phase2.store.sqlite_store import (
-    DELETED_PLACEHOLDER,
     IllegalStateTransitionError,
     MemoryStore,
     MemoryStoreError,
@@ -218,7 +217,6 @@ class TestMemoryUnitCRUD:
         assert counts[MemoryStatus.ACTIVE] == 3
         assert counts[MemoryStatus.COMPRESSED] == 0
         assert counts[MemoryStatus.FORGOTTEN] == 0
-        assert counts[MemoryStatus.DELETED] == 0
 
     def test_storage_pressure(self, store: MemoryStore) -> None:
         for i in range(7):
@@ -279,7 +277,9 @@ class TestCompression:
 
         loaded_mu = store.get_memory_unit(mu.mu_id)
         assert loaded_mu is not None
-        assert loaded_mu.status == MemoryStatus.COMPRESSED
+        # New design: original MU lands in ARCHIVED (the original-data tier);
+        # the searchable presence in the compressed tier is the CompressedLabel.
+        assert loaded_mu.status == MemoryStatus.ARCHIVED
         assert loaded_mu.compressed_label_id == label.label_id
         assert loaded_mu.archived_entry_id == archive.archived_entry_id
 
@@ -425,11 +425,13 @@ class TestForget:
         assert store.get_compressed_label(label.label_id) is None
         assert store.get_archived_entry(archive.archived_entry_id) is None
 
-    def test_forget_deleted_raises(self, store: MemoryStore) -> None:
+    def test_forget_after_hard_delete_raises_not_found(self, store: MemoryStore) -> None:
+        # Hard-delete removes the row outright; forget_atomic must surface a
+        # not-found error rather than silently succeed against a ghost row.
         mu = _make_mu()
         store.insert_memory_unit(mu)
         store.delete_atomic(mu.mu_id)
-        with pytest.raises(IllegalStateTransitionError):
+        with pytest.raises(MemoryUnitNotFoundError):
             store.forget_atomic(mu.mu_id)
 
 
@@ -439,29 +441,27 @@ class TestForget:
 
 
 class TestDeletion:
-    def test_delete_creates_audit_and_nulls_content(self, store: MemoryStore) -> None:
+    def test_delete_hard_removes_row_and_writes_audit(self, store: MemoryStore) -> None:
         mu = _make_mu()
         store.insert_memory_unit(mu)
         store.delete_atomic(mu.mu_id, deleted_by="test_user")
 
-        loaded = store.get_memory_unit(mu.mu_id)
-        assert loaded is not None
-        assert loaded.status == MemoryStatus.DELETED
-        assert loaded.claim == DELETED_PLACEHOLDER
-        assert loaded.original_text == DELETED_PLACEHOLDER
-        # Provenance preserved (mu_id, conversation_id, dia_ids)
-        assert loaded.source_dia_ids == ["D1:1"]
+        # Row must be gone from memory_units entirely.
+        assert store.get_memory_unit(mu.mu_id) is None
 
+        # Audit row carries the surviving provenance trail.
         audit = store.list_deletion_audit("conv_1")
         assert len(audit) == 1
         assert audit[0].mu_id == mu.mu_id
         assert audit[0].deleted_by == "test_user"
+        assert audit[0].source_dia_ids == ["D1:1"]
 
     def test_delete_idempotent(self, store: MemoryStore) -> None:
         mu = _make_mu()
         store.insert_memory_unit(mu)
         store.delete_atomic(mu.mu_id)
-        store.delete_atomic(mu.mu_id)  # second call no-op
+        # Second call must be a no-op (audit already exists; row is gone).
+        store.delete_atomic(mu.mu_id)
         audit = store.list_deletion_audit()
         assert len(audit) == 1
 
@@ -489,11 +489,10 @@ class TestDeletion:
 
         store.delete_atomic(mu.mu_id)
 
-        loaded = store.get_memory_unit(mu.mu_id)
-        assert loaded is not None and loaded.status == MemoryStatus.DELETED
+        # MU row is gone, label + archive are gone, edges on both sides cleared.
+        assert store.get_memory_unit(mu.mu_id) is None
         assert store.get_compressed_label(label.label_id) is None
         assert store.get_archived_entry(archive.archived_entry_id) is None
-        # Edge cleared on both sides
         assert store.edges_to(mu.mu_id) == []
         assert store.edges_from(mu.mu_id) == []
 

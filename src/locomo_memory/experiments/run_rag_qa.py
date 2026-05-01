@@ -21,7 +21,6 @@ import argparse
 import hashlib
 import json
 import logging
-import os
 import subprocess
 import time
 from collections import defaultdict

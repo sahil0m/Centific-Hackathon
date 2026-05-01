@@ -462,6 +462,11 @@ class TestHybridMemoryRetriever:
         assert result.conversation_id == "conv1"
 
     def test_retrieve_returns_active_only(self, store):
+        # When the forgotten fallback is disabled, the retriever must not
+        # surface forgotten MUs even if they would otherwise match. With the
+        # fallback enabled the retriever is allowed to promote a forgotten
+        # MU back to active on a query hit; that path is exercised by
+        # test_forgotten_fallback_returns_forgotten_mus.
         hr = _make_hybrid_retriever(store)
         mu_active = _mu("Alice at Google", mu_id="m1")
         mu_forgotten = _mu("Bob in NYC", mu_id="m2")
@@ -472,7 +477,11 @@ class TestHybridMemoryRetriever:
         hr.faiss_index.add_mu(mu_active)
         hr.bm25_index.add_mu(mu_active)
 
-        result = hr.retrieve("Alice", conversation_id="conv1")
+        cfg = HybridRetrieverConfig(
+            enable_forgotten_worker=False,
+            enable_forgotten_fallback=False,
+        )
+        result = hr.retrieve("Alice", conversation_id="conv1", config_override=cfg)
         mu_ids = result.mu_ids
         assert "m1" in mu_ids
         assert "m2" not in mu_ids
@@ -705,6 +714,10 @@ class TestHybridMemoryRetriever:
         assert result.forgotten_searched is True
 
     def test_forgotten_fallback_returns_forgotten_mus(self, store):
+        # The forgotten fallback must surface forgotten MUs that match the
+        # query. Auto-promote then moves the matched MU back to ACTIVE, so
+        # we assert via ``hit.sources`` (which records the original lane)
+        # rather than by the post-promotion status.
         hr = _make_hybrid_retriever(store)
         mu = _mu("forgotten specific fact", mu_id="m1")
         store.insert_memory_unit(mu)
@@ -716,8 +729,10 @@ class TestHybridMemoryRetriever:
         )
         result = hr.retrieve("forgotten specific fact", conversation_id="conv1", config_override=cfg)
         assert result.forgotten_searched is True
-        forgotten_hits = [h for h in result.hits if h.mu.status == MemoryStatus.FORGOTTEN]
-        assert len(forgotten_hits) >= 1
+        forgotten_lane_hits = [h for h in result.hits if "forgotten" in h.sources]
+        assert len(forgotten_lane_hits) >= 1
+        # And the auto-promote moved it back to ACTIVE in the store.
+        assert store.get_memory_unit("m1").status == MemoryStatus.ACTIVE
 
     def test_forgotten_fallback_deleted_still_excluded(self, store):
         hr = _make_hybrid_retriever(store)
@@ -759,6 +774,11 @@ class TestHybridMemoryRetriever:
             assert "label" not in hit.sources
 
     def test_label_hit_is_from_label_true(self, store):
+        # A query that matches a CompressedLabel must surface the underlying
+        # MU. Auto-promote then moves the MU from ARCHIVED back to ACTIVE
+        # and clears ``is_from_label`` on the hit (since the MU is now
+        # active in its own right). We assert via ``hit.sources`` so the
+        # invariant survives the post-promotion state.
         import json
         hr = _make_hybrid_retriever(store)
 
@@ -785,10 +805,10 @@ class TestHybridMemoryRetriever:
         hr.label_index.add_label(label)
 
         result = hr.retrieve("Alice Google", conversation_id="conv1")
-        label_hits = [h for h in result.hits if h.is_from_label]
-        # If the label hit was hydrated, is_from_label should be True
-        # (the MU is now COMPRESSED in the store)
-        assert len(label_hits) >= 1
+        label_lane_hits = [h for h in result.hits if "label" in h.sources]
+        assert len(label_lane_hits) >= 1
+        # Auto-promote must have moved the MU back to ACTIVE.
+        assert store.get_memory_unit("m1").status == MemoryStatus.ACTIVE
 
     # ------------------------------------------------------------------
     # Maintenance

@@ -12,7 +12,6 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -32,7 +31,6 @@ class MemoryStatus(str, Enum):
     COMPRESSED = "compressed"
     ARCHIVED = "archived"
     FORGOTTEN = "forgotten"
-    DELETED = "deleted"
 
 
 class EdgeType(str, Enum):
@@ -227,10 +225,10 @@ class EdgeRecord(BaseModel):
 class DeletionAudit(BaseModel):
     """Tombstone record for a permanently deleted Memory Unit.
 
-    Created when a user explicitly deletes a MU. The original MU row is kept
-    in ``memory_units`` with content nulled and status DELETED, so foreign
-    references stay traceable. This separate audit row records the deletion
-    event itself.
+    Created when a user explicitly deletes a MU. The MU row itself is hard-
+    deleted from ``memory_units`` (along with any compressed label, archive
+    snapshot, and edges). This audit row is the only surviving trace of the
+    deletion event and is used for compliance/audit reporting.
     """
 
     model_config = ConfigDict(validate_assignment=True)

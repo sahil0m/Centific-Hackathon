@@ -1,6 +1,0 @@
-experiment,category,count,avg_f1,exact_match_rate,avg_evidence_recall,avg_grounding_score,guard_pass_rate
-phase2_retrieval_selector_top5,1,282,0.0,0.0,0.2556,1.0,1.0
-phase2_retrieval_selector_top5,2,321,0.0,0.0,0.642,1.0,1.0
-phase2_retrieval_selector_top5,3,96,0.0,0.0,0.2271,1.0,1.0
-phase2_retrieval_selector_top5,4,841,0.0,0.0,0.585,1.0,1.0
-phase2_retrieval_selector_top5,5,446,0.0,0.0,0.4664,1.0,1.0

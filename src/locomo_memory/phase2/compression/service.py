@@ -81,18 +81,22 @@ class VerificationResult:
 
 @dataclass(slots=True)
 class CompressionStats:
-    """Per-status counts for a conversation's memory store."""
+    """Per-status counts for a conversation's memory store.
+
+    Hard-deleted MUs do not appear here — their rows are removed from the
+    ``memory_units`` table; only the audit row in ``deletion_audit``
+    survives. See ``MemoryStore.list_deletion_audit`` for that view.
+    """
 
     conversation_id: str
     active: int = 0
     compressed: int = 0
     forgotten: int = 0
     archived: int = 0
-    deleted: int = 0
 
     @property
     def total(self) -> int:
-        return self.active + self.compressed + self.forgotten + self.archived + self.deleted
+        return self.active + self.compressed + self.forgotten + self.archived
 
 
 # ---------------------------------------------------------------------------
@@ -286,9 +290,11 @@ class CompressionService:
             return VerificationResult(mu_id=mu_id, valid=False,
                                       issues=[f"MU not found: {mu_id}"])
 
-        if mu.status != MemoryStatus.COMPRESSED:
+        # A compressed MU sits in ARCHIVED status (the original-data tier);
+        # legacy COMPRESSED rows are still acceptable for backward compatibility.
+        if mu.status not in (MemoryStatus.ARCHIVED, MemoryStatus.COMPRESSED):
             issues.append(
-                f"status is '{mu.status.value}', expected 'compressed'"
+                f"status is '{mu.status.value}', expected 'archived' (or legacy 'compressed')"
             )
             return VerificationResult(mu_id=mu_id, valid=False, issues=issues)
 
@@ -358,7 +364,6 @@ class CompressionService:
             compressed=counts.get(MemoryStatus.COMPRESSED, 0),
             forgotten=counts.get(MemoryStatus.FORGOTTEN, 0),
             archived=counts.get(MemoryStatus.ARCHIVED, 0),
-            deleted=counts.get(MemoryStatus.DELETED, 0),
         )
 
 
